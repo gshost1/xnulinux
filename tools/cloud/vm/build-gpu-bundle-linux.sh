@@ -271,6 +271,7 @@ for s in $STAGES; do
   # each stage in a subshell: what one exports or changes (SDKROOT, the directory) must not reach the next, or a stage
   # would behave differently in a full run and when it is run again alone
   if [ "$s" = preflight ]; then do_preflight; rc=$?; else ( "do_$s" ) > "$WORK/logs/$s.log" 2>&1; rc=$?; fi
+  [ $rc = 0 ] || [ "$s" != preflight ] || exit $rc	# preflight has said what is missing, and writes no log
   [ $rc = 0 ] || { err "stage $s failed (status $rc); see $WORK/logs/$s.log. Fix the cause and run the same command again."; exit $rc; }
   [ "$s" = preflight ] || "check_$s" || { err "stage $s ran but its output is not there; see $WORK/logs/$s.log"; exit 1; }
   say "$s: done in $(( $(date +%s) - t0 )) s"
