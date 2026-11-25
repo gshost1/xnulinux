@@ -10,7 +10,7 @@
     disk_linux.py verify  --dvm DIR --out DIR --user NAME
 
 The APFS work is done by macOS-DroidVM's own scripts, loaded at run time from the checkout in --dvm (a pinned commit that
-build-disk-linux.sh fetches; that repository has no licence file, so nothing of it is copied here) and by the Linux apfs
+build-disk-linux.sh fetches; used with its author's permission, its issue #3; nothing of it is copied here) and by the Linux apfs
 driver. What this file adds is the disk layout xnulinux needs and the staging of the Data volume:
 
 - a GPT disk with two APFS containers. The first is a small "iBoot System Container" (its own partition type) with the

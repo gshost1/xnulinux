@@ -2,8 +2,9 @@
 # Pinned revisions of everything build-disk-linux.sh fetches. Sourced as shell. Nothing listed here is stored in this
 # repository: it is fetched onto the build host, used there, and stays there.
 #
-# macOS-DroidVM: the range fetcher for Apple's restore image and the offline APFS tools. No licence file at this commit,
-# so its files are only fetched and run, never copied or changed (see docs/cloud-arm.md, "What the Linux build fetches").
+# macOS-DroidVM: the range fetcher for Apple's restore image and the offline APFS tools. No licence file at this commit;
+# its author allows use with attribution (Droid-VM/macOS-DroidVM issue #3, 2026-11-25; MIT file to follow). Its files
+# are fetched and run, not copied or changed (see docs/cloud-arm.md, "What the Linux build fetches").
 DROIDVM_URL=https://github.com/Droid-VM/macOS-DroidVM.git
 DROIDVM_COMMIT=524d27bf57ae92375aa39e3a81e11727c08973ff
 # The Linux APFS driver (GPL-2.0-only) and its user-space tools (GPL-2.0-only), at the commits macOS-DroidVM pins in

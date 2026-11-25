@@ -466,17 +466,17 @@ exact revisions are in `tools/cloud/vm/build-disk-linux.lock`.
 
 | What | Revision | Licence | Used for |
 |---|---|---|---|
-| [macOS-DroidVM](https://github.com/Droid-VM/macOS-DroidVM) | commit `524d27b` | **none stated**: the repository has no licence file | Its range fetcher (`macos-inputs.py`, `macos-fetch-member.py`) and its offline APFS tools (`make-macos-disk.py`, `apfs-add-volumes.py`, `grow-data-store.py`). |
+| [macOS-DroidVM](https://github.com/Droid-VM/macOS-DroidVM) | commit `524d27b` | no licence file at this commit; its main author allows use of the scripts and code with attribution and says an MIT licence file will follow ([issue #3](https://github.com/Droid-VM/macOS-DroidVM/issues/3), 2026-11-25) | Its range fetcher (`macos-inputs.py`, `macos-fetch-member.py`) and its offline APFS tools (`make-macos-disk.py`, `apfs-add-volumes.py`, `grow-data-store.py`). |
 | [linux-apfs-rw](https://github.com/linux-apfs/linux-apfs-rw) | commit `0318712` | GPL-2.0-only | The kernel module `apfs.ko`, built for the running kernel and loaded while the disk is built. |
 | [apfsprogs](https://github.com/linux-apfs/apfsprogs) | commit `1bd1c1c` | GPL-2.0-only | `mkapfs`, for the new volumes. |
 | [ipsw](https://github.com/blacktop/ipsw) | release 3.1.749, checked by SHA-256 | MIT | Decrypting the two encrypted members. |
 | macOS 27.2 (26B123) restore image | Apple's update server; manifest SHA-256 pinned by macOS-DroidVM | Apple's software licence | The system itself. See the note at the top of this guide. |
 
-Because macOS-DroidVM states no licence, this repository copies none of its code. The script downloads it to your
-VM at the pinned commit and runs it there, unchanged on disk. Three things are adjusted from outside at run time, and
+macOS-DroidVM is used with its author's permission and credited here. This repository still copies none of its code:
+the script downloads it to your VM at the pinned commit and runs it there, unchanged on disk. Three things are adjusted from outside at run time, and
 `tools/cloud/vm/disk_linux.py` explains each: which volumes it adds to the main container, extended attributes in
-its `rsync` calls, and a stand-in for `unshare` on hosts that forbid unprivileged user namespaces. Whether running
-code that has no stated licence suits you is your decision.
+its `rsync` calls, and a stand-in for `unshare` on hosts that forbid unprivileged user namespaces. The pinned commit
+has no licence file yet; the permission is the author's statement in issue #3.
 
 **The GPU bundle.** `XnuCpuMetal.bundle` is built from open source: this repository's plugin and bridge
 (GPL-2.0-or-later), metal2vulkan (GPL-2.0-or-later or LGPL-3.0-or-later), Mesa's lavapipe (MIT), LLVM (Apache-2.0 with
