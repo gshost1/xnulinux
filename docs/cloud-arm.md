@@ -74,7 +74,7 @@ Rough time and cost, where it was measured:
 | Step | Measured |
 |---|---|
 | Kernel build on the VM, first time | About 55 minutes of VM time, including four failed tries that the fixes in this branch now avoid. A rebuild after a patch takes 25 to 35 seconds. |
-| **Disk on the VM (section 7)** | **About 5.5 minutes from nothing**: 132 s to fetch and decrypt 13.8 GB, 183 s to build a 120 GiB image, 10 s to prepare and check it. |
+| **Disk on the VM (section 7)** | **About 6 minutes from nothing** (5.5 and 6.4 measured): 132 to 173 s to fetch and decrypt 13.8 GB, 183 to 196 s to build the image, 10 s to prepare and check it. |
 | Disk and GPU bundle on the Mac (section 8) | 8 minutes once the guest was installed and the tools were there. Installing the guest (a download of about 25 GB plus Apple's installer) was not timed. |
 | Mac to bucket, 23 GB | 40 seconds to pack, 206 seconds to upload (Mac and bucket in the same region). |
 | Bucket to VM, 28 GB | About 10 minutes; the VM's disk was the slow part. |
@@ -391,14 +391,14 @@ is missing). `--help` says exactly which commands run as root.
 
 | Option | Default | What it does |
 |---|---|---|
-| `--size-gib N` | 64 | Size of the main container. The image is sparse: it takes about 22 GB on the VM's disk at any size. 120 was tested. |
-| `--user NAME` | `xnu` | The hosted administrator. The other tools assume `xnu` (`GUEST_USER`). |
-| `--ssh-key FILE`, `--ssh on\|off` | on when a key is given | Remote Login, and your key in the user's `authorized_keys`. |
+| `--size-gib N` | 64 | Size of the main container. The image is sparse: it takes about 22 GB on the VM's disk at any size. 64 and 120 were tested. |
+| `--user NAME` | `xnu` | The hosted administrator. The other tools assume `xnu` (`GUEST_USER`). Another name was built and booted once: account, home, automatic login, ssh and `sudo` worked. |
+| `--ssh-key FILE`, `--ssh on\|off` | on when a key is given | Remote Login, and your key in the user's `authorized_keys`. With `--ssh off` port 22 refuses connections and the root console still works; a key given with it is written all the same. |
 | `--screen-sharing on\|off` | off | Screen Sharing (port 5900 in the guest). |
-| `--autologin on\|off` | on | Off shows the login window at boot; log in with `tools/cloud/guest-login` (section 11). |
-| `--tuning on\|off` | on | The settings of section 12, applied to the disk before the first boot. |
+| `--autologin on\|off` | on | Off shows the login window at boot, about two minutes after a first boot. It shows the user's picture and name first: click that, then the password field appears; then log in with `tools/cloud/guest-login` (section 11). |
+| `--tuning on\|off` | on | The settings of section 12, applied to the disk before the first boot. Off was booted once: the first boot is heavier (load average about 300 after four minutes). |
 | `--macos NAME` | `27.2-26B123` | The macOS build. It must match the kernel collection. Only this one was tested. |
-| `--work DIR` | `OUT-work` | Downloads and tools. Keep it: a later build reuses it and takes about 3 minutes. |
+| `--work DIR` | `OUT-work` | Downloads and tools. Keep it: a later build reuses it, downloads nothing and takes a little over 4 minutes (three builds: 250 to 261 s). |
 | `--force STAGE` | | Run a stage again. `--force image` rebuilds `mac.img` from the downloads. |
 
 To change an option on a disk that exists (for example automatic login), stop the hosted system and run the same
@@ -406,7 +406,8 @@ command with the new value: only `stage` and `finish` run again, in about 10 sec
 the disk. It is meant for a fresh disk. On a disk that macOS has already used it works too (it was done five times
 here and every boot afterwards was normal), but Linux then writes into a volume macOS has been writing, and Apple's
 own checker has things to say afterwards (section 16). For a disk you care about, change such settings inside the
-guest instead, or build the disk again.
+guest instead, or build the disk again. A disk that was staged once and never written from Linux again checked clean
+after two hours of use (section 16).
 
 **Measured** on the VM of section 1 (4 vCPU; the hosted system was stopped or idle):
 
@@ -417,9 +418,10 @@ guest instead, or build the disk again.
 | `image` | 183 s for 120 GiB |
 | `stage` | 2 to 3 s |
 | `finish` | 6 to 7 s |
-| Whole build, from nothing | about 5.5 minutes |
+| Whole build, from nothing | about 5.5 minutes; 6.4 minutes at the default 64 GiB while the VM was compiling (173 s download, 196 s image) |
 | `mac.img` on disk | 22 GB (sparse; 20 GB System, 1.9 GB Data) |
-| First boot: root shell / login window or desktop / calm | 40 s / about 2 minutes / about 5 minutes |
+| First boot: root shell / login window or desktop / calm | 40 to 58 s / about 2 minutes / 5 to 9 minutes |
+| Later boots: root shell / Dock | 27 to 32 s / 51 to 54 s on an idle VM; 35 to 41 s / 62 to 66 s while it compiles |
 
 **What this disk lacks, compared with one built on a Mac (section 8):**
 
@@ -435,9 +437,11 @@ guest instead, or build the disk again.
 - **Apple's installer never ran.** The user account, the "setup done" marks and the launchd settings are written
   straight into the Data volume by `tools/hosted/gui-user.py` and the script.
 
-It was booted 14 times, one of which failed (Troubleshooting, "A boot ends after a few seconds"), and run for 48
-minutes with applications opened and closed. Section 16 says exactly what was tested. The Mac-built disk has more
-hours behind it.
+A disk built this way at the default size, staged once, was booted 59 times and run once for two hours with
+applications opened and closed; Apple's `fsck_apfs` found nothing to report on any of its volumes afterwards. One of
+its boots failed in the first seconds; the Mac-built disk failed the same way under the same conditions
+(Troubleshooting, "A boot ends after a few seconds"). Section 16 says exactly what was tested. The Mac-built disk
+has more hours behind it.
 
 **How it works, in short.** Apple's restore image is a ZIP file on Apple's server, so single members can be fetched
 by HTTP range: the System volume (a bare APFS container), two cryptex images and three trust caches. Two members are
@@ -476,7 +480,7 @@ Three bundles were run on a Linux-built disk here:
 |---|---|---|
 | Mac build, with the Venus library | `tools/cloud/mac/build-disk.sh gpu` | 7 boots (one failed, see Troubleshooting) and a 48-minute run; it is also the bundle of the Mac-built disk, with many hours of use |
 | Prebuilt bundle (not published) | on a Mac, both architectures from source, path-clean, stripped, no Venus library | 4 boots, a 25-minute run with applications opened and closed, `tests/hosted` |
-| Linux build | `tools/cloud/vm/build-gpu-bundle-linux.sh`, on the VM | 2 boots (one with the bundle from the script as published), a 14-minute run with applications opened and closed, `tests/hosted` |
+| Linux build | `tools/cloud/vm/build-gpu-bundle-linux.sh`, on the VM | Earlier builds: 2 boots and a 14-minute run. The bundle of the script's run from nothing, on its own fresh disk: 5 boots, a 38-minute run with applications opened and closed, `tests/hosted`, no crash report |
 
 With each of them the window server, an arm64e program of Apple's, loaded the four files of the bundle, the desktop
 and application windows were drawn, and no crash report was written for the window server or the icon service.
@@ -501,9 +505,10 @@ pinned in `tools/cloud/vm/build-disk-linux.lock`):
 
 Limits of the Linux build as tested: the script was run from nothing in one go once, from a fresh clone into an empty
 work folder, on the VM of section 1 (Ubuntu 26.04, clang 21.1.8, SDK 26.1) after section 4 had installed its
-packages there: 88 minutes, no manual step. The bundle of that run was checked on the VM (the four files are
-universal arm64 + arm64e and their signatures are intact) but not booted when this was written. A bundle made earlier
-by the same stages, run one at a time, is the one that was booted, and it was used for about twenty minutes. The
+packages there: 88 minutes, no manual step. A second run from nothing took 78 minutes and gave the same plugin,
+loader and renderer byte for byte. The bundle of the first run was checked on the VM (the four files are universal
+arm64 + arm64e and their signatures are intact), put on a fresh disk and booted 5 times; the window server mapped its
+four files, and the last boot ran 38 minutes with applications opened and closed, without a crash report. The
 bundle is not stripped, and one of its files (`libxnu_m2v.dylib`) contains the paths of the build folder, 926 times
 when counted: fine on your own VM, not something to pass on. The graphics tests under `gpu/xnu-cpu-metal/test` were
 not run against it.
@@ -699,6 +704,8 @@ the VM by DHCP; the tools look it up.
 
   1. `tools/cloud/guest-screenshot now.png`, and look at it. You must see the password field.
   2. If the field is not focused, click it (for the lock screen at this resolution: `tools/cloud/guest-input click 640 718`).
+     The login window of a disk built with `--autologin off` shows only the user's picture and name at first: click
+     that (about 640 675), take another screenshot, and the field is there.
   3. `tools/cloud/guest-login`
 
   Never skip the fresh screenshot. A password typed while the screen is still changing goes to whatever has the
@@ -925,13 +932,15 @@ counts the data blocks and sets the "allocated" total to match. After it: 0 such
 kernel log was read. To check a disk
 that is not booted: `python3 tools/cloud/vm/apfs-alloc-count.py --offset $((501 << 20)) mac.img`.
 
-**A boot ends after a few seconds. The log has `[Event: fsck] posix_spawn(): 14: Bad address` and
-`userspace panic: boot task failure: fsck - posix_spawn: 14: Bad address`.**
-Cause: unknown. launchd's very first program start of the boot failed, and launchd stops the system on purpose when a
-boot task fails. It happened on one boot of 14 of the Linux-built disk. The disk had not changed since the boot
-before and checked clean; the next boot of the same disk was normal. Compile jobs were running on the VM at the
-time, as they were during other boots that worked. Whether it is tied to the Linux-built disk or to the host being
-busy was not established.
+**A boot ends after a few seconds. The log has `posix_spawn(): 14: Bad address` for one of launchd's boot tasks
+(`fsck` or `mount-phase-2` so far) and `userspace panic: boot task failure: ... - posix_spawn: 14: Bad address`.**
+Cause: not established. In the first four seconds of a boot launchd could not start a program, and launchd stops the
+system on purpose when a boot task fails. In one case the program it could not start had run 20 milliseconds earlier
+in the same boot, so it is not the program's file. It does not depend on how the disk was built: while the VM was
+compiling (load average 8 to 10), a Linux-built disk failed 1 boot of 25 and the Mac-built disk 1 of 28, with the
+same line. On an idle VM there was no failure in 41 boots; that is too few to say it needs a busy VM (with the busy
+rate, 41 clean boots in a row happen one time in five). The error means the hosted kernel could not read or write the
+program's memory at that moment, which points at the hosting layer rather than the disk; that was not followed up.
 Fix: stop the run (`scripts/xnulinux-boot.sh stop`) and boot again. `boot-image.sh` reports this case with exit
 status 1 and the panic line.
 
@@ -1048,8 +1057,10 @@ Does not work or is missing:
   three daemons continue. Not investigated.
 - **On a Linux-built disk (section 7):** no developer tools, no Recovery system, no Intel support; files written by
   Linux are uncompressed and lack BSD file flags. The list is in section 7.
-- **The Linux build of the GPU bundle is new.** It was built once and used for about twenty minutes (section 7,
-  "The GPU bundle"). The Mac-built bundle is the one with hours of use.
+- **The Linux build of the GPU bundle is new.** It ran from nothing twice, and its bundle was booted 5 times and
+  used for 38 minutes (section 7, "The GPU bundle"). The Mac-built bundle is the one with hours of use.
+- **About one boot in 25 ends in its first seconds while the VM is busy**, with any disk (Troubleshooting, "A boot
+  ends after a few seconds"). The next boot works.
 - **A chess game crashed twice** (`EXC_ARM_DA_ALIGN` in a texture upload) before the two fixes and not in three tries
   after. The cause was never established.
 
@@ -1060,14 +1071,17 @@ Not tested:
   the build-script fixes were applied by hand on the VM in an earlier shape. A fresh VM built from `cloud-arm` from
   the first step has not been done. The Linux disk build of section 7 was run from this branch's files, on the VM
   that already had the kernel side.
-- **The Linux disk build beyond what is listed here.** Tested: one disk of 120 GiB, macOS 27.2 (26B123), on the VM of
-  section 1. 14 boots, one of which failed without an explanation; the login window with `--autologin off`, logged
-  in with the input tools; changing options on the existing disk five times (only the last two stages ran); a
-  48-minute run and two shorter ones with Safari, Calculator, System Settings, Terminal and Finder windows opened and
-  closed over ssh; ssh; the Screen Sharing handshake; `tests/hosted`; three different GPU bundles. Not tested: other
-  sizes (an earlier form of the same steps built 48 GiB), `--tuning off`, `--ssh off`, another user name, other
-  macOS builds, other hosts, days of uptime, filling the disk, saving and restoring it (section 17), and
-  `--install-deps` actually installing something.
+- **The Linux disk build beyond what is listed here.** Tested, all with macOS 27.2 (26B123) on the VM of section 1:
+  a disk of 120 GiB (14 boots, options changed on it five times, a 48-minute run, the Screen Sharing handshake) and a
+  disk of the default 64 GiB that was staged once (59 boots, 22 of them full boots to the Dock; a run of 2 hours 5
+  minutes with Safari, Calculator, System Settings, Terminal, TextEdit and Finder windows opened and closed 42 times
+  over ssh, two 300 MB copies compared by checksum, `tests/hosted` twice; no crash report during that run). With a
+  boot each: `--tuning off`, `--autologin off` (login window, typed login), `--ssh off`, another user name, a second
+  and third disk from the same work folder, `--install-deps` installing a missing package, four different GPU
+  bundles. Crash reports seen on these disks: a Spotlight extension of the voice-memo app (as on the Mac-built disk)
+  and `keybagd` once. Not tested: other sizes, other macOS builds, other hosts, days of uptime, filling the disk,
+  installing software in the guest, saving and restoring it (section 17), and the guide's steps typed on a VM that
+  has only this branch's checkout.
 - **A clean bill from Apple's `fsck_apfs` for a used Linux-built disk.** Run in the guest (`fsck_apfs -n -l`), it
   reports System and Preboot as OK. For the Data volume of the test disk it ended with "could not be verified
   completely", three times: reference counts of some extents, the block count, the size statistics of three folders,
@@ -1075,9 +1089,12 @@ Not tested:
   step of an earlier version of the staging script when it was run again on the used disk; that step is gone. The
   folder statistics are a likely result of Linux writing into folders macOS keeps statistics for. The extent warnings
   are not explained: checked from the VM after a sync and a stop, the same volume had no extent without an owner
-  three times and two small ones (14 blocks) twice. On the first Linux-built disk (staged once, booted twice) and on
-  the Mac-built disk, Data checked OK. **Not tested: this check on a Linux-built disk that was staged only once and
-  then used for a while.** Nothing was seen to go wrong in use.
+  three times and two small ones (14 blocks) twice. That disk had been re-staged from Linux five times after macOS
+  had used it. **A disk that was staged once and then used gets a clean bill:** after 14 boots and a two-hour run,
+  `fsck_apfs -n -l` said "appears to be OK" without a single warning for all nine volumes, four times over (also
+  after a clean stop and a new boot, and with applications open); the Mac-built disk gives the same answer for its
+  twelve volumes, and so does a real Mac. So the warnings belong to re-staging a used disk, which this guide advises
+  against. The check runs on the live system only; a check of the unmounted volumes from a second macOS was not done.
 - **The helper tools in their cleaned form.** Each tool's header says whether it was run or only syntax-checked. Run
   as published: `vm-ssh`, `vm-run`, `guest-ssh`, `guest-screenshot`, `boot-cycle.sh`, `vm/boot-image.sh` and the
   three files of the Linux disk build. The others were only syntax-checked; their private originals did the work.

@@ -32,7 +32,7 @@ the order.
    macOS to Apple-branded hardware, and the decision is theirs. State it once, plainly, without comment.
 4. **No Mac is required; say what replaces it.** `tools/cloud/vm/build-disk-linux.sh` builds the system disk on the
    Linux host, and `tools/cloud/vm/build-gpu-bundle-linux.sh` builds the GPU bundle (`XnuCpuMetal.bundle`) there. The
-   bundle build is new: it was run once and the result used for minutes, not hours; a Mac build with Apple's
+   bundle build is new: it ran from nothing twice and its result was used for 38 minutes; a Mac build with Apple's
    developer tools remains the well-used alternative. A prebuilt bundle exists but is not published: do not claim it
    is, and do not download a bundle from anyone the user has not named. Without a bundle there is no desktop, only a
    root shell.

@@ -26,8 +26,8 @@ Do not start a phase until the user has answered what that phase needs. Ask ever
    Apple SDKs and a Kernel Debug Kit from third-party mirrors on GitHub, pinned and checksummed by macOS-DroidVM. The
    alternative is that you supply your own copies from Apple." Run phase B only after a yes to one of the two.
 3. **The GPU bundle; no Mac is required.** The system disk is built on the VM (phase D), and so can the
-   `XnuCpuMetal.bundle` that draws the desktop (phase D step 1: about an hour and a half of compiling, new and tested
-   for minutes, not hours). A prebuilt bundle exists but is not published (a pending decision of this fork's
+   `XnuCpuMetal.bundle` that draws the desktop (phase D step 1: about an hour and a half of compiling; new: run from nothing
+   twice, its bundle used for 38 minutes). A prebuilt bundle exists but is not published (a pending decision of this fork's
    maintainer): do not look for a download and do not take one from anywhere the user has not named. Ask: "Do you
    have an XnuCpuMetal.bundle already? If not, shall I build it on the VM (default), or do you prefer to build it on
    an Apple silicon Mac with Apple's developer tools (which Mac: ssh host, user, key)?" Without a bundle the system
@@ -93,7 +93,7 @@ Do not start a phase until the user has answered what that phase needs. Ask ever
 | Long step | Rough duration | How to tell it is done |
 |---|---|---|
 | B: kernel build | tens of minutes (55 minutes of VM time including retries, the first time) | `ENDED` and the phase check passes |
-| D: disk on the VM | about 5.5 minutes from nothing (132 s download, 183 s image) | `grep -c "disk ready in" ~/disk.log` prints 1, and the phase check passes |
+| D: disk on the VM | 5.5 to 6.5 minutes from nothing (132 to 173 s download, 183 to 196 s image) | `grep -c "disk ready in" ~/disk.log` prints 1, and the phase check passes |
 | D: GPU bundle on the VM | about 1.5 hours on 4 CPUs (LLVM twice, 29 minutes each with 4 jobs; the rest about 30 minutes) | `grep -c "bundle ready" ~/gpu.log` prints 1 |
 | D: GPU bundle on a Mac (`gpu`), instead | not measured for a first build (it builds LLVM); 8 minutes for a rebuild with the disk | `~/xnubuild/logs/gpu.log` ends in `gpu stage done` |
 | D-mac: guest install (`vm`) | not measured: a 25 GB download plus Apple's installer | `~/xnubuild/logs/vm.log` ends in `vm stage done` |

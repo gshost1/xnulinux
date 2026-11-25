@@ -36,9 +36,11 @@
 # Status: new. Run from nothing in one go once, from a fresh clone into an empty work folder, on Ubuntu 26.04 arm64
 # (clang 21.1.8, SDK 26.1; 4 Neoverse V2 vCPUs, 4 jobs, a hosted macOS running on the same VM): 88 minutes with no
 # manual step (sources 83 s, linker 268 s, loader 8 s, bridge 649 s, llvm 4092 s, lavapipe 150 s, bundle 9 s), and the
-# same command again skipped every stage. That run's bundle was checked on the host: the four files are universal
-# arm64 + arm64e and their signatures' page hashes are right. It was not booted when this was written; a bundle made
-# earlier by the same stages, run one at a time, booted the hosted macOS 27.2 to a desktop. Also run: a stage stopped
+# same command again skipped every stage. A second run from nothing, of the script as it is now, took 78 minutes and
+# gave the same plugin, loader and renderer byte for byte. The first run's bundle was checked on the host (the four
+# files are universal arm64 + arm64e and their signatures' page hashes are right), put on a fresh disk and booted 5
+# times; the window server mapped its four files, and the last boot ran 38 minutes with applications opened and closed
+# and no crash report. Also run: a stage stopped
 # in the middle and started again (lavapipe), with the same bytes as a result. The host had the packages of
 # scripts/vm-xnu-build.sh. Not tested: a host without them, other hosts, other SDKs, hours of use.
 set -uo pipefail

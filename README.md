@@ -8,11 +8,12 @@ run the hosted macOS on a rented cloud ARM VM (Google Cloud C4A, Arm Neoverse V2
 - **A guide:** [`docs/cloud-arm.md`](docs/cloud-arm.md), from an empty VM to the desktop, with measured numbers, the
   failures met on the way, and what does not work.
 - **No Mac needed:** [`tools/cloud/vm/build-disk-linux.sh`](tools/cloud/vm/build-disk-linux.sh) fetches macOS 27.2
-  from Apple's update server onto the VM and builds a bootable disk there in about 5.5 minutes, and
+  from Apple's update server onto the VM and builds a bootable disk there in about 6 minutes, and
   [`tools/cloud/vm/build-gpu-bundle-linux.sh`](tools/cloud/vm/build-gpu-bundle-linux.sh) cross-builds the GPU bundle
-  that draws the desktop on the same VM (about an hour and a half; it needs Apple's macOS SDK). The bundle build is
-  new and lightly tested; building it on a Mac is still described as the alternative. A prebuilt bundle exists but is
-  not published.
+  that draws the desktop on the same VM (about an hour and a half; it needs Apple's macOS SDK). The bundle build ran
+  from nothing twice and its bundle was used for 38 minutes; building it on a Mac is still described as the
+  alternative. A prebuilt bundle exists but is not published. About one boot in 25 ended in the first seconds while
+  the VM was busy compiling, with a Linux-built and with a Mac-built disk alike: boot again (guide, Troubleshooting).
 - **Three fixes:** plain arm64 processes run with all four pointer-authentication keys off
   ([upstream PR #15](https://github.com/AFK-surf/xnulinux/pull/15)); lavapipe keeps the immutable samplers of a pushed
   descriptor set ([upstream PR #17](https://github.com/AFK-surf/xnulinux/pull/17)); and the build scripts work on a
