@@ -12,7 +12,8 @@ run the hosted macOS on a rented cloud ARM VM (Google Cloud C4A, Arm Neoverse V2
   [`tools/cloud/vm/build-gpu-bundle-linux.sh`](tools/cloud/vm/build-gpu-bundle-linux.sh) cross-builds the GPU bundle
   that draws the desktop on the same VM (about an hour and a half; it needs Apple's macOS SDK). The bundle build ran
   from nothing twice and its bundle was used for 38 minutes; building it on a Mac is still described as the
-  alternative. A prebuilt bundle exists but is not published. About one boot in 25 ended in the first seconds while
+  alternative. A prebuilt bundle is in the
+  [releases](https://github.com/gshost1/xnulinux/releases/tag/gpu-bundle-2026-11-24). About one boot in 25 ended in the first seconds while
   the VM was busy compiling, with a Linux-built and with a Mac-built disk alike: boot again (guide, Troubleshooting).
 - **Three fixes:** plain arm64 processes run with all four pointer-authentication keys off
   ([upstream PR #15](https://github.com/AFK-surf/xnulinux/pull/15)); lavapipe keeps the immutable samplers of a pushed

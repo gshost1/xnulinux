@@ -33,8 +33,9 @@ the order.
 4. **No Mac is required; say what replaces it.** `tools/cloud/vm/build-disk-linux.sh` builds the system disk on the
    Linux host, and `tools/cloud/vm/build-gpu-bundle-linux.sh` builds the GPU bundle (`XnuCpuMetal.bundle`) there. The
    bundle build is new: it ran from nothing twice and its result was used for 38 minutes; a Mac build with Apple's
-   developer tools remains the well-used alternative. A prebuilt bundle exists but is not published: do not claim it
-   is, and do not download a bundle from anyone the user has not named. Without a bundle there is no desktop, only a
+   developer tools remains the well-used alternative. A prebuilt bundle is published as a release of this fork
+   (`gpu-bundle-2026-11-24`, with checksums): offer it, check its checksum, and do not download a bundle from
+   anywhere else the user has not named. Without a bundle there is no desktop, only a
    root shell.
 5. **No Apple files from third parties, and none passed on.** Never download macOS, disk images, kernel collections or
    trust caches from anyone but Apple, and never upload them where others can read them. Nothing of Apple's is ever

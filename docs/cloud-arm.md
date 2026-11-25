@@ -49,8 +49,9 @@ Commands are marked with where they run: **VM** (the cloud VM), **Mac**, **lapto
 - **The GPU bundle** (`XnuCpuMetal.bundle`), the plugin that draws the desktop on the CPU. There are three ways to
   have one (section 7 step 1): build it on the VM with `tools/cloud/vm/build-gpu-bundle-linux.sh` (no Mac; about an
   hour and a half of compiling on 4 CPUs; it needs Apple's macOS SDK, which the kernel build of section 4 already
-  puts on the VM); use a prebuilt bundle (one exists, built from source with its licence notices and tested with
-  this guide, but **it is not published**: that decision is pending, so there is no download link here); or build
+  puts on the VM); use the prebuilt bundle from this fork's
+  [releases](https://github.com/gshost1/xnulinux/releases/tag/gpu-bundle-2026-11-24) (built from source, with its licence notices,
+  tested with this guide); or build
   it with Apple's developer tools on an Apple silicon Mac.
 - **No Mac for the system disk.** The default route (section 7) builds it on the VM from Apple's restore image. The
   older route (section 8) builds it on an Apple silicon Mac with Apple's own installer; it is kept as the alternative
@@ -321,9 +322,17 @@ is missing). `--help` says exactly which commands run as root.
 
    - **A prebuilt bundle.** One was built for this guide from the sources and patches in this repository (both
      architectures from source, no private paths, with a notice file for every licence) and tested on this route. It
-     is not published; that decision is pending. If you were given it, or built one yourself earlier, unpack it on
-     the VM as `~/gpu/XnuCpuMetal.bundle`. Take a bundle only from someone you trust: it is code that runs inside
-     every process that draws.
+     is the release [`gpu-bundle-2026-11-24`](https://github.com/gshost1/xnulinux/releases/tag/gpu-bundle-2026-11-24)
+     of this fork. On the **VM**:
+
+     ```sh
+     mkdir -p ~/gpu && cd ~/gpu
+     B=https://github.com/gshost1/xnulinux/releases/download/gpu-bundle-2026-11-24
+     curl -fLO $B/XnuCpuMetal.bundle.tar.zst -O $B/SHA256SUMS
+     head -1 SHA256SUMS | sha256sum -c && tar --zstd -xf XnuCpuMetal.bundle.tar.zst
+     ```
+
+     Take a bundle only from someone you trust: it is code that runs inside every process that draws.
    - Build it on an Apple silicon Mac. This takes the `deps` and `gpu` stages of section 8 only: no macOS guest, no
      restore image, no desktop session. On the **Mac**, in a copy of `tools/cloud/mac/`:
 
@@ -479,7 +488,7 @@ Three bundles were run on a Linux-built disk here:
 | Bundle | How it was built | What it was run for |
 |---|---|---|
 | Mac build, with the Venus library | `tools/cloud/mac/build-disk.sh gpu` | 7 boots (one failed, see Troubleshooting) and a 48-minute run; it is also the bundle of the Mac-built disk, with many hours of use |
-| Prebuilt bundle (not published) | on a Mac, both architectures from source, path-clean, stripped, no Venus library | 4 boots, a 25-minute run with applications opened and closed, `tests/hosted` |
+| Prebuilt bundle (this fork's release `gpu-bundle-2026-11-24`) | on a Mac, both architectures from source, path-clean, stripped, no Venus library | 4 boots, a 25-minute run with applications opened and closed, `tests/hosted` |
 | Linux build | `tools/cloud/vm/build-gpu-bundle-linux.sh`, on the VM | Earlier builds: 2 boots and a 14-minute run. The bundle of the script's run from nothing, on its own fresh disk: 5 boots, a 38-minute run with applications opened and closed, `tests/hosted`, no crash report |
 
 With each of them the window server, an arm64e program of Apple's, loaded the four files of the bundle, the desktop

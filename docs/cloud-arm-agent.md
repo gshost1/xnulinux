@@ -27,10 +27,10 @@ Do not start a phase until the user has answered what that phase needs. Ask ever
    alternative is that you supply your own copies from Apple." Run phase B only after a yes to one of the two.
 3. **The GPU bundle; no Mac is required.** The system disk is built on the VM (phase D), and so can the
    `XnuCpuMetal.bundle` that draws the desktop (phase D step 1: about an hour and a half of compiling; new: run from nothing
-   twice, its bundle used for 38 minutes). A prebuilt bundle exists but is not published (a pending decision of this fork's
-   maintainer): do not look for a download and do not take one from anywhere the user has not named. Ask: "Do you
-   have an XnuCpuMetal.bundle already? If not, shall I build it on the VM (default), or do you prefer to build it on
-   an Apple silicon Mac with Apple's developer tools (which Mac: ssh host, user, key)?" Without a bundle the system
+   twice, its bundle used for 38 minutes). A prebuilt bundle is published as the release `gpu-bundle-2026-11-24`
+   of this fork; do not take one from anywhere else the user has not named. Ask: "Do you have an XnuCpuMetal.bundle
+   already? If not, shall I build it on the VM (default), download this fork's prebuilt one and check its checksum,
+   or do you prefer to build it on an Apple silicon Mac with Apple's developer tools (which Mac: ssh host, user, key)?" Without a bundle the system
    boots to a root shell only, with no desktop. Use the Mac route
    (phases D-mac and E-mac) only if the user asks for a disk installed by Apple's installer or with developer tools on
    it; then the Mac needs about 80 GB free and must not be a VM.
