@@ -15,7 +15,8 @@
 #
 # Stages, in order; with none named, all run. A stage is skipped when its output exists.
 #   preflight  the host's tools: clang, lld and llvm 21 (or newer) from the distribution, cmake, ninja, meson >= 1.5,
-#              glslangValidator, python3 with mako, git, curl. Changes nothing; prints the apt line for what is missing.
+#              glslangValidator, flex, bison, patch, python3 with mako and yaml, git, curl. Changes nothing; prints the
+#              apt line for what is missing.
 #   sources    gpu/xnu-cpu-metal/scripts/fetch-sources.sh (metal2vulkan, Vulkan-Loader, LLVM, Mesa, with this repository's
 #              patches) and the Vulkan headers.
 #   linker     Apple's ld64 for Linux: cctools-port built with apple-libtapi. It is needed for arm64e: LLVM's ld64.lld (21
@@ -71,9 +72,10 @@ resign() { python3 "$HERE/macho-adhoc-resign.py" "$@" > /dev/null; }
 do_preflight() {
   local t missing=""
   for t in "$L/clang" "$L/ld64.lld" "$L/llvm-ar" "$L/llvm-objcopy" "$L/llvm-lipo" "$L/llvm-install-name-tool"; do [ -x "$t" ] || missing="$missing $(basename "$t")"; done
-  for t in cmake ninja meson glslangValidator git curl python3 make; do command -v $t >/dev/null || missing="$missing $t"; done
+  for t in cmake ninja meson glslangValidator flex bison patch git curl python3 make; do command -v $t >/dev/null || missing="$missing $t"; done
   python3 -c 'import mako' 2>/dev/null || missing="$missing python3-mako"
-  [ -z "$missing" ] || { err "missing:$missing. On Ubuntu: sudo apt-get install -y clang-21 lld-21 llvm-21 cmake ninja-build meson glslang-tools python3-mako git curl build-essential"; return 3; }
+  python3 -c 'import yaml' 2>/dev/null || missing="$missing python3-yaml"
+  [ -z "$missing" ] || { err "missing:$missing. On Ubuntu: sudo apt-get install -y clang-21 lld-21 llvm-21 cmake ninja-build meson glslang-tools flex bison python3-mako python3-yaml git curl build-essential"; return 3; }
   say "host ok: $("$L/clang" --version | head -1), SDK $(basename "$SDK"), $JOBS jobs"
 }
 do_sources() {
