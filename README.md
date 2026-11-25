@@ -7,12 +7,18 @@ run the hosted macOS on a rented cloud ARM VM (Google Cloud C4A, Arm Neoverse V2
 
 - **A guide:** [`docs/cloud-arm.md`](docs/cloud-arm.md), from an empty VM to the desktop, with measured numbers, the
   failures met on the way, and what does not work.
+- **No Mac needed:** [`tools/cloud/vm/build-disk-linux.sh`](tools/cloud/vm/build-disk-linux.sh) fetches macOS 27.2
+  from Apple's update server onto the VM and builds a bootable disk there in about 5.5 minutes, and
+  [`tools/cloud/vm/build-gpu-bundle-linux.sh`](tools/cloud/vm/build-gpu-bundle-linux.sh) cross-builds the GPU bundle
+  that draws the desktop on the same VM (about an hour and a half; it needs Apple's macOS SDK). The bundle build is
+  new and lightly tested; building it on a Mac is still described as the alternative. A prebuilt bundle exists but is
+  not published.
 - **Three fixes:** plain arm64 processes run with all four pointer-authentication keys off
   ([upstream PR #15](https://github.com/AFK-surf/xnulinux/pull/15)); lavapipe keeps the immutable samplers of a pushed
   descriptor set ([upstream PR #17](https://github.com/AFK-surf/xnulinux/pull/17)); and the build scripts work on a
   fresh Ubuntu 26.04 host. The `bluetoothd` restart loop is reported as
   [upstream issue #16](https://github.com/AFK-surf/xnulinux/issues/16) and worked around with a boot argument.
-- **Helper tools:** [`tools/cloud/`](tools/cloud/README.md) (ssh, screenshots, input, image transfer, disk build), and
+- **Helper tools:** [`tools/cloud/`](tools/cloud/README.md) (ssh, screenshots, input, disk build, image transfer), and
   tests with expected output in [`tests/hosted/`](tests/hosted/README.md) and [`tests/lavapipe/`](tests/lavapipe/README.md).
 - **For AI coding agents:** a runbook, [`docs/cloud-arm-agent.md`](docs/cloud-arm-agent.md), and [`AGENTS.md`](AGENTS.md).
   A prompt to paste:

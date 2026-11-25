@@ -3,7 +3,7 @@
 This file is written for an AI coding agent that has been asked to set up xnulinux on a rented arm64 VM with no GPU.
 It is the same procedure as [`cloud-arm.md`](cloud-arm.md), arranged for unattended work: phases with entry
 conditions, exact commands, a check after each phase, and what to do when a known failure appears. Read
-`cloud-arm.md` section 14 (troubleshooting) when a failure is not listed here.
+`cloud-arm.md` section 15 (troubleshooting) when a failure is not listed here.
 
 **Prompt for the user to paste:**
 
@@ -25,21 +25,32 @@ Do not start a phase until the user has answered what that phase needs. Ask ever
 2. **Third-party mirrors in the kernel build.** Tell the user: "The upstream build script (phase B) downloads two
    Apple SDKs and a Kernel Debug Kit from third-party mirrors on GitHub, pinned and checksummed by macOS-DroidVM. The
    alternative is that you supply your own copies from Apple." Run phase B only after a yes to one of the two.
-3. **An Apple silicon Mac is required** (phases D and E). The disk is made by Apple's installer under Apple's
-   Virtualization framework, and the Metal plugin needs Apple's developer tools. Ask: which Mac, how you reach it
-   (ssh host, user, key), and whether it is rented. It needs macOS 27, about 80 GB free, and must not be a VM.
+3. **The GPU bundle; no Mac is required.** The system disk is built on the VM (phase D), and so can the
+   `XnuCpuMetal.bundle` that draws the desktop (phase D step 1: about an hour and a half of compiling, new and tested
+   for minutes, not hours). A prebuilt bundle exists but is not published (a pending decision of this fork's
+   maintainer): do not look for a download and do not take one from anywhere the user has not named. Ask: "Do you
+   have an XnuCpuMetal.bundle already? If not, shall I build it on the VM (default), or do you prefer to build it on
+   an Apple silicon Mac with Apple's developer tools (which Mac: ssh host, user, key)?" Without a bundle the system
+   boots to a root shell only, with no desktop. Use the Mac route
+   (phases D-mac and E-mac) only if the user asks for a disk installed by Apple's installer or with developer tools on
+   it; then the Mac needs about 80 GB free and must not be a VM.
 4. **Money.** Before each of these, say what it is and the expected cost, and wait:
    - the VM (4 vCPU, 32 GB arm64; price per hour from the provider's price list; the whole procedure needs several
      hours of it, plus as long as the user wants the system up);
-   - a rented Mac, if any (price from the provider; a few hours of work, but check the provider's minimum term);
-   - storage for the disk image (measured: about 2.30 US dollars a month per 100 GB; one image is about 30 GB);
-   - network transfer out of a cloud region (estimated, not confirmed: 1.50 to 2.50 US dollars for 29 GB between
-     continents).
+   - a rented Mac, only if the user chose a Mac for the GPU bundle or the Mac route (price from the provider;
+     check the provider's minimum term);
+   - storage, only if the image is saved outside the VM (measured: about 2.30 US dollars a month per 100 GB; one
+     image is about 30 GB);
+   - network transfer out of a cloud region, only on the Mac route or when saving (estimated, not confirmed: 1.50 to
+     2.50 US dollars for 29 GB between continents). The default route downloads 13.8 GB from Apple into the VM; inbound
+     transfer is free at most providers, but check.
    You do not know the user's prices. Look them up or ask; do not guess a total.
 5. **Credentials.** You need, through the user's own secret mechanism and never in chat: a login to the cloud
-   provider (or a VM the user already made, with an ssh key), write access to a bucket if one is used, the Mac's
-   login password if automatic login must be set (phase D), and a password for the guest user. Ask the user to put
-   passwords in files that only they can read and to tell you the paths. Never display a secret, never put one on
+   provider (or a VM the user already made, with an ssh key), a password for the guest user, and an ssh public key
+   for reaching the guest; on the Mac route also write access to a bucket if one is used and the Mac's login password
+   if automatic login must be set. **The guest password lives in a file on the VM** (mode 600; phase D makes a random
+   one unless the user wants their own). Ask the user to put passwords in files that only they can read and to tell
+   you the paths. No Apple account is needed and none must be signed in to. Never display a secret, never put one on
    a command line, never write one into the repository or a log.
 6. **Names and places.** Where the VM is (address, user, key), the bucket name if any, and where you may keep
    working files on the user's machine.
@@ -82,9 +93,11 @@ Do not start a phase until the user has answered what that phase needs. Ask ever
 | Long step | Rough duration | How to tell it is done |
 |---|---|---|
 | B: kernel build | tens of minutes (55 minutes of VM time including retries, the first time) | `ENDED` and the phase check passes |
-| D: guest install (`vm`) | not measured: a 25 GB download plus Apple's installer | `~/xnubuild/logs/vm.log` ends in `vm stage done` |
-| D: GPU bundle (`gpu`) | not measured for a first build (it builds LLVM); 8 minutes for a rebuild with the disk | `~/xnubuild/logs/gpu.log` ends in `gpu stage done` |
-| E: pack, upload, pull | 40 s + 206 s + about 10 minutes for 23 to 28 GB | each tool's `OK` or `pulled in` line |
+| D: disk on the VM | about 5.5 minutes from nothing (132 s download, 183 s image) | `grep -c "disk ready in" ~/disk.log` prints 1, and the phase check passes |
+| D: GPU bundle on the VM | about 1.5 hours on 4 CPUs (LLVM twice, 29 minutes each with 4 jobs; the rest about 30 minutes) | `grep -c "bundle ready" ~/gpu.log` prints 1 |
+| D: GPU bundle on a Mac (`gpu`), instead | not measured for a first build (it builds LLVM); 8 minutes for a rebuild with the disk | `~/xnubuild/logs/gpu.log` ends in `gpu stage done` |
+| D-mac: guest install (`vm`) | not measured: a 25 GB download plus Apple's installer | `~/xnubuild/logs/vm.log` ends in `vm stage done` |
+| E-mac: pack, upload, pull | 40 s + 206 s + about 10 minutes for 23 to 28 GB | each tool's `OK` or `pulled in` line |
 | F: boot to desktop | about 2 minutes | phase check |
 | H: save | 226 s to pack 29 GB, 148 s to upload | `READBACK-OK`, then `relay: OK` |
 
@@ -183,8 +196,84 @@ Do not start a phase until the user has answered what that phase needs. Ask ever
   `fki:` line missing: `systemctl status xnulinux-fki.service` on the VM; a message that the carve-out "overlaps" or
   "is not all RAM" means the numbers do not fit this memory map. `cma=` is not a substitute.
 
-## Phase D: disk built on the Mac
+## Phase D: disk built on the VM (default, no Mac)
 
+- **Entry:** phases A and B pass (C may come before or after); user's yes to items 1 and 3; 60 GB free where the disk
+  goes (`df -h /var/tmp`), 15 GB more for the bundle build; `sudo -n true` works on the VM.
+- **Idempotent:** yes. Every stage is skipped when it is done and still checks out; a failed run continues where it
+  stopped when the same command is run again. **Inspect first:** `tail -3 ~/disk.log` on the VM, and whether
+  `/var/tmp/macimg/mac.img` exists. The `image` stage is the only one that starts over when interrupted.
+- **Do, step 1 (only without a bundle on the VM; long):** build it on the VM. It needs the macOS SDK that phase B
+  left in `~/w/dvm/toolchains/sdks/MacOSX26.1.sdk` (the user said yes to that source in item 2).
+
+  ```sh
+  tools/cloud/vm-ssh 'sudo -n apt-get install -y -q clang-21 lld-21 llvm-21 cmake ninja-build meson glslang-tools python3-mako >/dev/null && echo TOOLS-OK'
+  tools/cloud/vm-ssh 'cd ~/w/poc && nohup bash tools/cloud/vm/build-gpu-bundle-linux.sh --out ~/gpu > ~/gpu.log 2>&1 < /dev/null & echo started'
+  tools/cloud/vm-ssh 'tail -2 ~/gpu.log; pgrep -f build-gpu-bundle-linux.sh >/dev/null && echo RUNNING || echo ENDED'
+  ```
+
+  Its exit status: `0` done, `1` a stage failed (the message names the stage's log under `~/gpu-work/logs/`), `2` a
+  missing input (no SDK: phase B was not done), `3` a missing tool (the message has the `apt-get` line). Run the same
+  command again after a failure: finished stages are skipped. If the same stage fails twice, stop and report the end
+  of its log; the alternative is the Mac build below.
+- **Or, step 1 on a Mac instead (only if the user chose it):** copy `tools/cloud/mac/` to the Mac (below
+  `~/cloudmac`), then
+
+  ```sh
+  REPO_URL=https://github.com/gshost1/xnulinux.git REPO_REF=cloud-arm bash ~/cloudmac/build-disk.sh deps
+  nohup bash ~/cloudmac/build-disk.sh gpu > ~/gpu.out 2>&1 < /dev/null &
+  ```
+
+  Poll `tail -1 ~/xnubuild/logs/gpu.log` until it ends in `gpu stage done`; then, on the Mac, with a key the VM accepts:
+
+  ```sh
+  tar -C ~/xnubuild/xnulinux/gpu/xnu-cpu-metal/dist -czf - XnuCpuMetal.bundle | ssh VM_USER@VM_ADDRESS 'mkdir -p ~/gpu && tar -C ~/gpu -xzf -'
+  ```
+
+- **Check 1 (L):** `tools/cloud/vm-ssh 'test -s ~/gpu/XnuCpuMetal.bundle/Contents/Frameworks/libvulkan_lvp.dylib && test -s ~/gpu/XnuCpuMetal.bundle/Contents/MacOS/XnuCpuMetal && echo BUNDLE-OK'`
+- **Do, step 2 (L):** the password file and the key. Do not replace a password file that exists.
+
+  ```sh
+  tools/cloud/vm-ssh 'test -s ~/guest-pass || (umask 077; head -c 32 /dev/urandom | base64 | tr -dc A-Za-z0-9 | head -c 16 > ~/guest-pass; echo >> ~/guest-pass); stat -c %a ~/guest-pass'   # 600
+  tools/cloud/vm-ssh 'cat > ~/guest.pub' < "$GUEST_KEY.pub"
+  ```
+
+  Never print `~/guest-pass`. Tell the user where it is. If they want to keep a copy on L for `guest-login`, they copy
+  it themselves, or you copy it with `scp` to a mode-600 file without displaying it, and set `GUEST_PASSWORD_FILE`.
+- **Do, step 3 (L), long:**
+
+  ```sh
+  tools/cloud/vm-ssh 'cd ~/w/poc && nohup bash tools/cloud/vm/build-disk-linux.sh --out /var/tmp/macimg --gpu-bundle ~/gpu/XnuCpuMetal.bundle --password-file ~/guest-pass --ssh-key ~/guest.pub --install-deps > ~/disk.log 2>&1 < /dev/null & echo started'
+  tools/cloud/vm-ssh 'tail -2 ~/disk.log; pgrep -f build-disk-linux.sh >/dev/null && echo RUNNING || echo ENDED'
+  ```
+
+  Exit status of the script (last line of the log names the stage): `0` done, `1` a stage failed, `2` a missing or
+  unreadable input, `3` the host cannot do it (no passwordless sudo, not arm64, too little space).
+- **Check 2 (L):** output `DISK-OK`:
+
+  ```sh
+  tools/cloud/vm-ssh 'cd /var/tmp/macimg && test -s mac.img && grep -q "^ROOT_UUID=" mac.conf && grep -q "^BOOT_UUID=" mac.conf && test -s trustcache.bin && python3 ~/w/poc/tools/cloud/vm/apfs-alloc-count.py --offset $((501 << 20)) mac.img >/dev/null && sgdisk -p mac.img | grep -q iBootSystemContainer && echo DISK-OK'
+  ```
+
+- **Known failures:**
+
+  | Seen in `~/disk.log` | Do |
+  |---|---|
+  | `try N failed: ... Connection reset` | Nothing: it retries. `could not fetch ... in 12 tries`: run the same command again later. Twice: stop. |
+  | `sudo asks for a password` (status 3) | The user must give the VM user passwordless sudo. Do not work around it. |
+  | `is not an XnuCpuMetal.bundle` (status 2) | `--gpu-bundle` must point at the `.bundle` folder itself: step 1. |
+  | `can be read by other users: chmod 600 it` | `chmod 600` the password file. |
+  | `has NN GB free` (status 3) | Ask the user: free space, or name another `--out` and `--work`. |
+  | `apfs.ko did not build` | Kernel headers missing or a newer kernel than the driver supports: report the log; do not change the pinned revisions on your own. |
+  | `mac.img was built with 'size=...'` (status 2) | The options changed. Ask the user before `--force image`: it deletes the existing image. |
+  | `stage image failed` | Run the same command once more (the stage starts over). Twice the same: stop and report the end of the log file that the error message names. |
+
+- **To change an option later** (automatic login, ssh, tuning): stop the hosted system (phase F, "Stop"), run the
+  step 3 command with the new option; only `stage` and `finish` run again.
+
+## Phase D-mac (alternative): disk built on a Mac
+
+- **When:** only if the user chose the Mac route in item 3. Otherwise skip to phase F.
 - **Entry:** user's yes to items 1, 3, 4 (Mac) and 5; ssh to the Mac; `tools/cloud/mac/` copied to the Mac (below,
   in `~/cloudmac`). The user has put the guest password in a file on the Mac (here `~/guest-pass`, mode 600) and a
   public ssh key in `~/guest.pub`. The user has said where the macOS 27.2 (26B123) restore image is: a file on the
@@ -232,9 +321,9 @@ Do not start a phase until the user has answered what that phase needs. Ask ever
   | `gpu` fails otherwise | Do not use `GPU_STUB=1` unless the user accepts a system with no desktop. Report the log's last 30 lines. |
   | `mk-macvm-disk.sh changed` | Upstream's disk script no longer matches what `build-disk.sh` edits. Stop and report. |
 
-## Phase E: disk on the VM
+## Phase E-mac (alternative): move the Mac-built disk to the VM
 
-- **Entry:** phase D passes; phases A to C pass; 60 GB free on the VM; user's yes to the transfer cost and, for a
+- **Entry:** phase D-mac passes; phases A to C pass; 60 GB free on the VM; user's yes to the transfer cost and, for a
   bucket, write access set up.
 - **Idempotent:** yes. The relay resends only wrong parts; the pull overwrites.
 - **Do, with a bucket (settings `BUCKET`, `MAC_HOST`, `MAC_USER`, `MAC_KEY`):**
@@ -261,7 +350,7 @@ Do not start a phase until the user has answered what that phase needs. Ask ever
 
 ## Phase F: boot
 
-- **Entry:** phases C and E pass; no hosted system running (`lsmod | grep -c '^xnu '` is 0 on the VM).
+- **Entry:** phase C passes, and phase D (or D-mac and E-mac); no hosted system running (`lsmod | grep -c '^xnu '` is 0 on the VM).
 - **Idempotent:** no. Booting twice is refused; stop first. **Inspect first:** is `xnu` loaded? If yes, go to the check.
 - **Do (L):**
 
@@ -282,9 +371,12 @@ Do not start a phase until the user has answered what that phase needs. Ask ever
   |---|---|
   | `boot-image: xnu.ko is not loaded` | Read `/var/tmp/xnu-boot-dmesg.txt` on the VM for `XNU panic` or `took a fault`. Report the lines. |
   | `no contiguous memory for XNU` or `fki has no carve-out` | Phase C did not take: run its check. |
-  | Console stops at `Waiting on ... IOMedia` | `mac.conf` does not belong to this `mac.img`. Redo phase E. |
-  | Console reaches `xnulinux#` but no desktop; log has `_spvBinaryToText` | The GPU bundle is broken: phase D, SPIRV-Tools row, then E and F again. |
-  | ssh refused but the screenshot shows a desktop | The disk was made without `EXTRAS=1`. Use `guest-console`, or redo D. |
+  | Console stops at `Waiting on ... IOMedia` | `mac.conf` does not belong to this `mac.img`. Run phase D's script again (it rewrites `mac.conf`), or redo E-mac. |
+  | `XNU panic`, with `mount-phase-1` and `xART volume mount failed` in the log | The disk has no iBoot System Container partition: it was not made by `build-disk-linux.sh`. Rebuild it with phase D. |
+  | Console reaches `xnulinux#` but no desktop; log has `_spvBinaryToText` | A Mac-built GPU bundle is broken: rebuild it (phase D-mac, SPIRV-Tools row), then run phase D step 3 again (a changed bundle makes `stage` run again by itself). |
+  | Console reaches `xnulinux#` but no desktop after 3 minutes, with a bundle built on the VM | Read the hosted log for `XnuCpuMetal` and `dlopen` lines and report them. Do not rebuild blindly: this build path is new. |
+  | The screenshot is black two minutes after the first boot of a new disk | Expected: the first boot is busy for about five minutes. Wait and take another; do not send input. |
+  | ssh refused but the screenshot shows a desktop | The disk was made without `--ssh-key` (or without `EXTRAS=1` on the Mac route). Use `guest-console`, or run phase D step 3 again with the key. |
   | Screenshot shows a login window | The window server restarted. Follow the hard rules: fresh screenshot, see the field, then `guest-login`. |
 
 - **Stop (when needed):** `tools/cloud/guest-ssh 'sync; sync'` then
@@ -292,9 +384,11 @@ Do not start a phase until the user has answered what that phase needs. Ask ever
 
 ## Phase G: tuning (optional)
 
+- **Skip it for a disk from phase D:** the tuning is already on the disk (unless `--tuning off` was used); run only
+  the check. The rest is for a Mac-built disk.
 - **Entry:** phase F passes. Ask the user whether they want it: it disables system services inside the guest.
 - **Idempotent:** yes.
-- **Do:** the commands in `cloud-arm.md` section 11, as root with
+- **Do:** the commands in `cloud-arm.md` section 12, as root with
   `tools/cloud/guest-ssh 'sudo -S -p "" sh -c "..."' < "$GUEST_PASSWORD_FILE"`. Do **not** disable
   `com.apple.siriactionsd`. Then stop and boot again (phase F).
 - **Check (L):** `tools/cloud/guest-ssh 'launchctl print-disabled system | grep -c disabled'` prints 14 or more, and
@@ -305,7 +399,7 @@ Do not start a phase until the user has answered what that phase needs. Ask ever
 - **Entry:** user's yes to the storage cost; hosted system stopped; free space on the VM about equal to the image's
   used size.
 - **Idempotent:** yes (replaces its earlier output).
-- **Do and check:** `cloud-arm.md` section 16. Success is `READBACK-OK` and two `relay: OK` lines. Boot again
+- **Do and check:** `cloud-arm.md` section 17. Success is `READBACK-OK` and two `relay: OK` lines. Boot again
   afterwards (phase F). Ask before deleting the staging folder on the VM.
 
 ## Final verification checklist
@@ -325,13 +419,14 @@ tar -C tests -cf - hosted | tools/cloud/guest-ssh 'rm -rf ~/xt && mkdir ~/xt && 
 2. Desktop up and ssh works: second command prints the version and `desktop-up`.
 3. `bluetoothd` stable: `runs = 1`.
 4. Screenshot taken: look at `final.png` and describe what is on it. Show it to the user.
-5. `keys` and `exc` (two of the three test programs): `hosted tests: pass`. This needs `clang` in the guest; if it is
-   not there, report "not run: no compiler in the guest", do not install one without asking.
+5. `keys` and `exc` (two of the three test programs): `hosted tests: pass`. This needs `clang` in the guest, and a disk
+   from phase D has none. Then report "not run: no compiler in the guest" (or, if the user has the four programs built
+   elsewhere, copy them in and run `sh ~/xt/hosted/run.sh FOLDER`); do not install a compiler without asking.
 6. `lvp_push_immutable` (the third): on the Mac, against the lavapipe the bundle was built from, following
-   [`tests/lavapipe/README.md`](../tests/lavapipe/README.md). Expected `RESULT: PASS`, exit status 0. If the Mac is
-   gone, report "not run".
+   [`tests/lavapipe/README.md`](../tests/lavapipe/README.md). Expected `RESULT: PASS`, exit status 0. If no Mac was
+   used or it is gone, report "not run".
 7. Crash reports since boot: list what `boot-cycle.sh 0` printed. A few at login are known
-   (`cloud-arm.md` section 14); `iconservicesagent` or `WindowServer` in the list means the renderer fix is not in
+   (`cloud-arm.md` section 15); `iconservicesagent` or `WindowServer` in the list means the renderer fix is not in
    the bundle.
 
 Then tell the user: what is running and what it costs per hour while it stays up, where the image and any saved copy

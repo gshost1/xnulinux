@@ -13,7 +13,7 @@ helper tools for one more kind of host: a rented cloud ARM VM with no GPU.
 |---|---|
 | `docs/cloud-arm-agent.md` | **The runbook for you.** Phases, commands, checks, known failures, what to ask first. |
 | `docs/cloud-arm.md` | The same procedure for a person, with the reasons, measured numbers and troubleshooting. |
-| `tools/cloud/` | Non-interactive helpers (ssh to the VM and the guest, screenshots, input, image transfer, disk build). Start with its `README.md`; every tool has `--help`. |
+| `tools/cloud/` | Non-interactive helpers (ssh to the VM and the guest, screenshots, input, the disk build on Linux or on a Mac, image transfer). Start with its `README.md`; every tool has `--help`. |
 | `tests/hosted/`, `tests/lavapipe/` | Test programs with expected output. |
 | `README.md`, `docs/production.md` | Upstream's description of the project and its stopgaps. |
 | `LICENSE`, `LICENSES/` | Per-directory licences. Every source file carries an `SPDX-License-Identifier` line in its first three lines; CI checks it. |
@@ -26,10 +26,16 @@ the order.
 1. **Ask before spending.** Renting a VM or a Mac, storage and network transfer cost money. State the expected cost
    and wait for a yes.
 2. **Ask before anything that needs a login or a password.** Get credentials through the user's own secret mechanism.
-   Never print, log or commit one. Passwords are read from files the user names, over standard input.
+   Never print, log or commit one. Passwords are read from files the user names (the guest's password file on the VM
+   included), never from a command line. No Apple account is needed; never sign in to one.
 3. **Tell the user about Apple's licence** before any step that installs or runs macOS: Apple's licence restricts
    macOS to Apple-branded hardware, and the decision is theirs. State it once, plainly, without comment.
-4. **An Apple silicon Mac is required** to build the system disk. Say so early; there is no workaround in this repository.
+4. **No Mac is required; say what replaces it.** `tools/cloud/vm/build-disk-linux.sh` builds the system disk on the
+   Linux host, and `tools/cloud/vm/build-gpu-bundle-linux.sh` builds the GPU bundle (`XnuCpuMetal.bundle`) there. The
+   bundle build is new: it was run once and the result used for minutes, not hours; a Mac build with Apple's
+   developer tools remains the well-used alternative. A prebuilt bundle exists but is not published: do not claim it
+   is, and do not download a bundle from anyone the user has not named. Without a bundle there is no desktop, only a
+   root shell.
 5. **No Apple files from third parties, and none passed on.** Never download macOS, disk images, kernel collections or
    trust caches from anyone but Apple, and never upload them where others can read them. Nothing of Apple's is ever
    committed here: no binaries, images, kernel caches, trust caches, crash reports or disassembly.

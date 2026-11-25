@@ -4,8 +4,9 @@ Small scripts for working with xnulinux when the Linux host is a rented cloud VM
 are the cleaned-up forms of the scripts used for [`docs/cloud-arm.md`](../../docs/cloud-arm.md); an agent runbook that
 uses them is in [`docs/cloud-arm-agent.md`](../../docs/cloud-arm-agent.md). License: GPL-2.0-only, like `scripts/`.
 
-Three machines appear below: **yours** (a laptop, any Linux or macOS with ssh), the **VM** (the arm64 Linux host) and
-the **Mac** (Apple silicon, builds the disk).
+Three machines appear below: **yours** (a laptop, any Linux or macOS with ssh), the **VM** (the arm64 Linux host, which
+also builds the system disk and can build the GPU bundle) and the **Mac** (Apple silicon; optional: the alternative
+way to build the GPU bundle and the disk).
 
 ## Settings
 
@@ -47,13 +48,25 @@ to a program's standard input.
 
 ## On the VM (`vm/`, run through `vm-run` or copied there)
 
+`build-disk-linux.sh`, `build-gpu-bundle-linux.sh` and their helpers run from this repository's checkout on the VM,
+not through `vm-run`.
+
 | Tool | What it does | Repeat? | Example |
 |---|---|---|---|
+| `vm/build-disk-linux.sh` | Builds the system disk on the VM, without a Mac: fetches macOS from Apple's update server, makes `mac.img`, `mac.conf`, `trustcache.bin`. Options for size, user, password file, ssh key, automatic login, tuning. Needs a built GPU bundle. | yes: finished stages are skipped, a stopped run resumes | `bash tools/cloud/vm/build-disk-linux.sh --out /var/tmp/macimg --gpu-bundle ~/gpu/XnuCpuMetal.bundle --password-file ~/guest-pass --ssh-key ~/guest.pub` |
+| `vm/disk_linux.py` | Helper of the above: the disk layout and the Data volume. Loads macOS-DroidVM's APFS scripts at run time. | not run by hand | |
+| `vm/build-disk-linux.lock` | The pinned revisions of what the build fetches (macOS-DroidVM, linux-apfs-rw, apfsprogs, ipsw) and the macOS build. | a text file | |
+| `vm/build-gpu-bundle-linux.sh` | Cross-builds `XnuCpuMetal.bundle` (arm64 + arm64e) on the VM, without a Mac: Apple's ld64 for Linux, the Vulkan loader, the Rust bridge, LLVM, lavapipe, the plugin. Needs a macOS SDK on the VM. About 1.5 hours on 4 CPUs. | yes: finished stages are skipped | `bash tools/cloud/vm/build-gpu-bundle-linux.sh --out ~/gpu` |
+| `vm/macho-adhoc-resign.py` | Helper of the above: refreshes the page hashes of an ad-hoc code signature after a file was edited. | yes | `python3 tools/cloud/vm/macho-adhoc-resign.py libxnu_m2v.dylib` |
+| `vm/apfs-alloc-count.py` | Checks the block counters of every volume in an unmounted APFS image; `--fix` corrects what the Linux APFS driver leaves wrong (the cause of macOS's `fs_alloc_count mismatch` log lines). | yes | `python3 tools/cloud/vm/apfs-alloc-count.py --offset $((501 << 20)) /var/tmp/macimg/mac.img` |
 | `vm/boot-image.sh` | Installs an image folder's trust cache and `mac.conf`, boots it, prints the console's end. | no: refuses while a hosted system runs | `tools/cloud/vm-run tools/cloud/vm/boot-image.sh /var/tmp/macimg 100` |
 | `vm/pull-image.sh` | Fetches `NAME.tar.zst` from a bucket (token on stdin) and unpacks it. | yes: overwrites | `gcloud auth print-access-token \| tools/cloud/vm-run tools/cloud/vm/pull-image.sh BUCKET img1` |
 | `vm/save-image.sh` | Packs the stopped image and the kernel side into checked 1 GiB parts. | yes: replaces its earlier output | `tools/cloud/vm-run tools/cloud/vm/save-image.sh /var/tmp/macimg img1` |
 
 ## On the Mac (`mac/`, copy the folder there)
+
+Nothing here is needed when the disk and the GPU bundle are built on the VM. `build-disk.sh deps` and `gpu` build the
+GPU bundle on a Mac instead; the rest is the alternative disk build.
 
 | Tool | What it does | Repeat? | Example |
 |---|---|---|---|
@@ -74,6 +87,8 @@ says the rest.
 
 - The bucket tools speak Google Cloud Storage (`gcloud storage`, resumable upload URLs). Another object store needs the
   three `gcloud`/`curl` places changed; `build-disk.sh upload` and plain `scp` need no bucket at all.
+- `vm/build-disk-linux.sh` downloads macOS-DroidVM to the VM and runs it. That repository states no licence, so
+  nothing of it is in this one; see the guide, "What the Linux build fetches".
 - The image parts, the kernel-side archive and the backups **contain Apple's files**. Keep them in storage only you can
   read. Nothing in this repository contains them.
 - `guest-input` arguments are visible in process lists. Passwords go through `guest-login` only.

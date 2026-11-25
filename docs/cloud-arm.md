@@ -16,8 +16,10 @@ procedure is the same.
 - **Apple's licence.** Apple's software licence for macOS restricts it to Apple-branded hardware. The SDKs and the
   Kernel Debug Kit used to build the kernel have similar terms. Whether to go on is your decision. This repository
   contains no Apple files, and nothing here should be read as legal advice.
-- **Money.** A cloud VM, a rented Mac (if you do not own one), storage and network transfer all cost money. Section 1
-  says what was used. Check your provider's prices first.
+- **Money.** A cloud VM costs money, and so do storage and network transfer if you save the disk elsewhere. No Mac
+  is needed any more; one is only used on the alternative route of section 8, or if you prefer to build the GPU
+  bundle with Apple's developer tools.
+  Section 1 says what was used. Check your provider's prices first.
 
 ## Contents
 
@@ -27,27 +29,32 @@ procedure is the same.
 4. Build the kernel on the VM
 5. Reserve memory for the hosted kernel
 6. The settings file
-7. Build the disk on a Mac
-8. Move the disk to the VM
-9. Boot and stop
-10. Reach the hosted system
-11. Tuning for CPU rendering
-12. Check the result
-13. Measured numbers
-14. Troubleshooting
-15. What does not work, and what was not tested
-16. Saving your work
+7. Build the disk on Linux (no Mac)
+8. Alternative: build the disk on a Mac
+9. Move a Mac-built disk to the VM
+10. Boot and stop
+11. Reach the hosted system
+12. Tuning for CPU rendering
+13. Check the result
+14. Measured numbers
+15. Troubleshooting
+16. What does not work, and what was not tested
+17. Saving your work
 
 Commands are marked with where they run: **VM** (the cloud VM), **Mac**, **laptop** (your own machine) or **guest**
 (inside the hosted macOS).
 
 ## 1. What you need
 
-- **An Apple silicon Mac, for a few hours.** This is required, and there is no way around it here. The system disk is
-  made by Apple's own installer inside Apple's Virtualization framework, which only runs on Apple silicon, and the
-  Metal plugin that draws the desktop is built with Apple's developer tools. The Mac needs macOS 27, about 80 GB free,
-  and a user who can log in at its screen (a rented Mac needs automatic login, section 7). A Mac that is itself a
-  virtual machine will not do.
+- **The GPU bundle** (`XnuCpuMetal.bundle`), the plugin that draws the desktop on the CPU. There are three ways to
+  have one (section 7 step 1): build it on the VM with `tools/cloud/vm/build-gpu-bundle-linux.sh` (no Mac; about an
+  hour and a half of compiling on 4 CPUs; it needs Apple's macOS SDK, which the kernel build of section 4 already
+  puts on the VM); use a prebuilt bundle (one exists, built from source with its licence notices and tested with
+  this guide, but **it is not published**: that decision is pending, so there is no download link here); or build
+  it with Apple's developer tools on an Apple silicon Mac.
+- **No Mac for the system disk.** The default route (section 7) builds it on the VM from Apple's restore image. The
+  older route (section 8) builds it on an Apple silicon Mac with Apple's own installer; it is kept as the alternative
+  and is the only way to get a disk with developer tools already on it.
 - **An arm64 cloud VM.** What was used:
   - Google Cloud **C4A** (`c4a-highmem-4`): Arm **Neoverse V2**, **4 vCPU, 32 GB RAM**, 96 GB disk.
   - **Ubuntu 26.04 LTS** arm64, kernel **7.0.0-1017-gcp**, 4 KB pages.
@@ -57,23 +64,26 @@ Commands are marked with where they run: **VM** (the cloud VM), **Mac**, **lapto
   - Root access, Secure Boot off, kernel lockdown off, and the right to load unsigned kernel modules.
   Any arm64 VM with pointer authentication, 4 KB pages and at least 16 GB of RAM should be a candidate, but only the
   one above was tested. The memory numbers in section 5 are for 32 GB.
-- **A way to move about 30 GB** from the Mac to the VM: an object-storage bucket, or plain ssh if the two are close.
-- **Your own machine** with ssh, to drive both.
-- A macOS 27 restore image (`.ipsw`) from Apple. The build used here is **macOS 27.2 (26B123)**. The Mac downloads it.
+- **Your own machine** with ssh, to drive the VM.
+- **macOS 27.2 (26B123) from Apple.** On the default route the VM fetches 13.8 GB of Apple's restore image straight from
+  Apple's update server. On the Mac route the Mac downloads the whole image (about 25 GB), and you also need a way to
+  move about 30 GB from the Mac to the VM: an object-storage bucket, or plain ssh if the two are close.
 
 Rough time and cost, where it was measured:
 
 | Step | Measured |
 |---|---|
 | Kernel build on the VM, first time | About 55 minutes of VM time, including four failed tries that the fixes in this branch now avoid. A rebuild after a patch takes 25 to 35 seconds. |
-| Disk and GPU bundle on the Mac | 8 minutes once the guest was installed and the tools were there. Installing the guest (a download of about 25 GB plus Apple's installer) was not timed. |
+| **Disk on the VM (section 7)** | **About 5.5 minutes from nothing**: 132 s to fetch and decrypt 13.8 GB, 183 s to build a 120 GiB image, 10 s to prepare and check it. |
+| Disk and GPU bundle on the Mac (section 8) | 8 minutes once the guest was installed and the tools were there. Installing the guest (a download of about 25 GB plus Apple's installer) was not timed. |
 | Mac to bucket, 23 GB | 40 seconds to pack, 206 seconds to upload (Mac and bucket in the same region). |
 | Bucket to VM, 28 GB | About 10 minutes; the VM's disk was the slow part. |
 | Boot to desktop | About 1 minute after the hosted root shell appears. |
 | Storage | About 2.30 US dollars a month for 100 GB in one bucket. |
 | Network transfer, 29 GB between continents | Estimated at 1.50 to 2.50 US dollars. Not confirmed on a bill. |
 
-The VM's hourly price and the Mac rental were not recorded: look them up.
+The Mac rows apply to the alternative route only. The VM's hourly price and the Mac rental were not recorded: look
+them up.
 
 ## 2. How the pieces fit
 
@@ -81,8 +91,9 @@ The VM's hourly price and the Mac rental were not recorded: look them up.
   module that lends it CPUs, memory, a disk file and a network link.
 - The hosted kernel needs one block of memory that Linux never touches. On a VM you reserve it on the kernel command
   line (section 5).
-- The system disk is a file, `mac.img`, made on the Mac from a normal macOS install. It comes with two small files:
-  `mac.conf` (two volume identifiers) and `trustcache.bin`.
+- The system disk is a file, `mac.img`. It is built on the VM from Apple's restore image (section 7), or made on a
+  Mac from a normal macOS install (section 8). It comes with two small files: `mac.conf` (two volume identifiers) and
+  `trustcache.bin`.
 - With no GPU, everything on screen is drawn on the CPU by Mesa's lavapipe, inside every process that draws.
 - The desktop is a framebuffer that the VM dumps to a file. You look at it by converting the dump to a PNG, and you
   type and click by appending events to another file.
@@ -268,12 +279,238 @@ Each line, and why:
 | `RAM_MB=7900` | The hosted system's memory. It must fit inside the 8156 MB carve-out. |
 | `GPU=off` | There is no GPU and no virtio-gpu device. Everything is drawn on the CPU. |
 | `amfi_get_out_of_my_way=1 lp-sip0=2050` | Upstream's defaults: code-signing enforcement relaxed, as the disk is modified. They must be repeated because `BOOTARGS` replaces the default. |
-| `droidvm-timebase-hz=24000000` | The host's counter runs at 1 GHz; a Mac's runs at 24 MHz, and parts of macOS 27 assume that. The kernel then scales the counter by 3/125 (1 GHz × 3 / 125 = 24 MHz). The cost is in section 13. |
+| `droidvm-timebase-hz=24000000` | The host's counter runs at 1 GHz; a Mac's runs at 24 MHz, and parts of macOS 27 assume that. The kernel then scales the counter by 3/125 (1 GHz × 3 / 125 = 24 MHz). The cost is in section 14. |
 | `bt-transport-override=10` | Without a Bluetooth device, `bluetoothd` waits ten seconds for a chip, exits, and is restarted, forever. This selects its built-in virtual controller, so it starts once and stays. |
 
 Check: `cat /etc/xnulinux.conf` shows the four lines.
 
-## 7. Build the disk on a Mac
+## 7. Build the disk on Linux (no Mac)
+
+This is the main route. One script on the VM, `tools/cloud/vm/build-disk-linux.sh`, fetches macOS 27.2 (26B123) from
+Apple's own update server and builds `mac.img`, `mac.conf` and `trustcache.bin` on the VM. Nothing of Apple's leaves
+the VM, and nothing has to be moved between machines.
+
+It does not need a Mac. The one input it does not make itself is the **GPU bundle** (step 1): a second script
+builds that on the VM, or you bring a prebuilt one, or you build it on a Mac.
+
+Everything in this section runs on the **VM** unless marked. Do sections 3 and 4 first: the script runs from this
+repository's checkout in `~/w/poc`, and the disk must be the same macOS build as the kernel collection of section 4.
+
+**What it needs on the VM:** 60 GB free where the disk goes; `sudo` that does not ask for a password; the packages
+`git python3 curl rsync gdisk build-essential` and the headers of the running kernel (`--install-deps` installs what
+is missing). `--help` says exactly which commands run as root.
+
+1. **Get the GPU bundle onto the VM**, as a folder named `XnuCpuMetal.bundle`. It is the plugin that draws the
+   desktop on the CPU (lavapipe and the Metal-to-Vulkan layer). There are three ways to have one:
+
+   - **Build it on the VM.** No Mac. It needs the macOS SDK that section 4 left in
+     `~/w/dvm/toolchains/sdks/MacOSX26.1.sdk` (Apple's files, fetched there from a third-party mirror, as section 4
+     says), about 15 GB of disk, and time: LLVM is compiled twice, 29 minutes each with 4 jobs on an otherwise idle
+     VM; everything else takes about 30 minutes.
+
+     ```sh
+     cd ~/w/poc
+     sudo apt-get install -y clang-21 lld-21 llvm-21 cmake ninja-build meson glslang-tools python3-mako
+     nohup bash tools/cloud/vm/build-gpu-bundle-linux.sh --out ~/gpu > ~/gpu.log 2>&1 < /dev/null &
+     tail -f ~/gpu.log
+     ```
+
+     Check: the log ends with `bundle ready: .../gpu/XnuCpuMetal.bundle`. A stage that fails names its log; run the
+     same command again and finished stages are skipped. This route is new: read "The GPU bundle" at the end of this
+     section for exactly what was tested.
+
+   - **A prebuilt bundle.** One was built for this guide from the sources and patches in this repository (both
+     architectures from source, no private paths, with a notice file for every licence) and tested on this route. It
+     is not published; that decision is pending. If you were given it, or built one yourself earlier, unpack it on
+     the VM as `~/gpu/XnuCpuMetal.bundle`. Take a bundle only from someone you trust: it is code that runs inside
+     every process that draws.
+   - Build it on an Apple silicon Mac. This takes the `deps` and `gpu` stages of section 8 only: no macOS guest, no
+     restore image, no desktop session. On the **Mac**, in a copy of `tools/cloud/mac/`:
+
+     ```sh
+     REPO_URL=https://github.com/gshost1/xnulinux.git REPO_REF=cloud-arm bash build-disk.sh deps
+     nohup bash build-disk.sh gpu > ~/gpu.out 2>&1 &
+     ```
+
+     When `tail -1 ~/xnubuild/logs/gpu.log` ends in `gpu stage done`, send the bundle to the VM (85 MB packed):
+
+     ```sh
+     tar -C ~/xnubuild/xnulinux/gpu/xnu-cpu-metal/dist -czf - XnuCpuMetal.bundle | ssh VM_USER@VM_ADDRESS 'mkdir -p ~/gpu && tar -C ~/gpu -xzf -'
+     ```
+
+   The Mac build is the one with the most hours of use behind it.
+
+   Check (VM): `ls ~/gpu/XnuCpuMetal.bundle/Contents/Frameworks/` lists `libvulkan_lvp.dylib`, `libvulkan.1.dylib`
+   and `libxnu_m2v.dylib`. (A bundle built by the Mac route's scripts may also hold `libvulkan_virtio.dylib`; it is not
+   needed with `GPU=off`, and the prebuilt bundle leaves it out.)
+
+2. **Make the password file and the ssh key file.** The password is for the hosted user (and for `sudo` inside the
+   guest). It is read from a file; it is never typed on a command line. A random one:
+
+   ```sh
+   (umask 077; head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 16 > ~/guest-pass; echo >> ~/guest-pass)
+   ```
+
+   Or your own: `(umask 077; read -rs -p 'guest password: ' p; printf '%s\n' "$p" > ~/guest-pass)`.
+
+   Then, from your **laptop**, the public half of the key you will use to reach the guest:
+
+   ```sh
+   tools/cloud/vm-ssh 'cat > ~/guest.pub' < ~/.ssh/id_ed25519.pub
+   ```
+
+   Check (VM): `stat -c %a ~/guest-pass` prints `600`, and `ssh-keygen -lf ~/guest.pub` prints a fingerprint.
+   To log in by hand later you need the password: read the file yourself, or copy it to your laptop over ssh
+   (`GUEST_PASSWORD_FILE` in `cloud.env`).
+
+3. **Run the build** in the background and watch the log:
+
+   ```sh
+   cd ~/w/poc
+   nohup bash tools/cloud/vm/build-disk-linux.sh --out /var/tmp/macimg --gpu-bundle ~/gpu/XnuCpuMetal.bundle \
+     --password-file ~/guest-pass --ssh-key ~/guest.pub --install-deps > ~/disk.log 2>&1 < /dev/null &
+   tail -f ~/disk.log
+   ```
+
+   It runs six stages: `preflight`, `deps`, `inputs`, `image`, `stage`, `finish`. Each prints `STAGE: done in N s`.
+   If one fails, the last lines say what to fix; run the same command again and it continues after the last stage
+   that finished.
+
+   Check: the log's last lines are `disk ready in /var/tmp/macimg:`, the three files, and `boot it with: ...`. Then:
+
+   ```sh
+   cat /var/tmp/macimg/mac.conf     # ROOT_UUID=... BOOT_UUID=... MACOS=27.2
+   python3 tools/cloud/vm/apfs-alloc-count.py --offset $((501 << 20)) /var/tmp/macimg/mac.img   # every volume: ok
+   ```
+
+4. Boot it: section 10. The first boot is slow: the root shell comes after about 40 seconds, but the screen stays
+   black for up to two minutes, and the system is busy for about five minutes (load average above 100) while it
+   builds its caches. Later boots show the desktop in about one minute.
+
+**Options** (all in `build-disk-linux.sh --help`; each can also be set as an environment variable):
+
+| Option | Default | What it does |
+|---|---|---|
+| `--size-gib N` | 64 | Size of the main container. The image is sparse: it takes about 22 GB on the VM's disk at any size. 120 was tested. |
+| `--user NAME` | `xnu` | The hosted administrator. The other tools assume `xnu` (`GUEST_USER`). |
+| `--ssh-key FILE`, `--ssh on\|off` | on when a key is given | Remote Login, and your key in the user's `authorized_keys`. |
+| `--screen-sharing on\|off` | off | Screen Sharing (port 5900 in the guest). |
+| `--autologin on\|off` | on | Off shows the login window at boot; log in with `tools/cloud/guest-login` (section 11). |
+| `--tuning on\|off` | on | The settings of section 12, applied to the disk before the first boot. |
+| `--macos NAME` | `27.2-26B123` | The macOS build. It must match the kernel collection. Only this one was tested. |
+| `--work DIR` | `OUT-work` | Downloads and tools. Keep it: a later build reuses it and takes about 3 minutes. |
+| `--force STAGE` | | Run a stage again. `--force image` rebuilds `mac.img` from the downloads. |
+
+To change an option on a disk that exists (for example automatic login), stop the hosted system and run the same
+command with the new value: only `stage` and `finish` run again, in about 10 seconds. That keeps everything already on
+the disk. It is meant for a fresh disk. On a disk that macOS has already used it works too (it was done five times
+here and every boot afterwards was normal), but Linux then writes into a volume macOS has been writing, and Apple's
+own checker has things to say afterwards (section 16). For a disk you care about, change such settings inside the
+guest instead, or build the disk again.
+
+**Measured** on the VM of section 1 (4 vCPU; the hosted system was stopped or idle):
+
+| Step | Measured |
+|---|---|
+| `deps` (fetch the tools, build `mkapfs` and `apfs.ko`) | 11 s |
+| `inputs` (download and decrypt) | 132 s. 13.8 GB are fetched, of a restore image of 25.6 GB; they unpack to 17 GB, which stays in the work folder. Peak use while decrypting: 28 GB. |
+| `image` | 183 s for 120 GiB |
+| `stage` | 2 to 3 s |
+| `finish` | 6 to 7 s |
+| Whole build, from nothing | about 5.5 minutes |
+| `mac.img` on disk | 22 GB (sparse; 20 GB System, 1.9 GB Data) |
+| First boot: root shell / login window or desktop / calm | 40 s / about 2 minutes / about 5 minutes |
+
+**What this disk lacks, compared with one built on a Mac (section 8):**
+
+- **No developer tools and no third-party applications.** There is no compiler in the guest, so `tests/hosted`
+  needs programs built elsewhere (its README says how). Install software inside the guest afterwards.
+- **No Recovery system.** There is no Recovery container, the Recovery volume is empty, and Preboot holds only the
+  App cryptex, not the boot files a real Mac's firmware reads. A hosted boot uses none of them.
+- **Files are stored uncompressed, and without their BSD file flags.** The Linux APFS driver reads Apple's
+  compressed files but writes plain ones, and it cannot set flags such as `hidden` or `restricted`. The files that came
+  with Apple's System volume keep both. Extended attributes are copied (the only one Apple's files carry here is
+  `com.apple.rootless`; it was compared on all 17 folders that have it).
+- **No Intel support.** The x86-64 and Rosetta shared caches are left out.
+- **Apple's installer never ran.** The user account, the "setup done" marks and the launchd settings are written
+  straight into the Data volume by `tools/hosted/gui-user.py` and the script.
+
+It was booted 14 times, one of which failed (Troubleshooting, "A boot ends after a few seconds"), and run for 48
+minutes with applications opened and closed. Section 16 says exactly what was tested. The Mac-built disk has more
+hours behind it.
+
+**How it works, in short.** Apple's restore image is a ZIP file on Apple's server, so single members can be fetched
+by HTTP range: the System volume (a bare APFS container), two cryptex images and three trust caches. Two members are
+encrypted; Apple's key server gives their keys without an account. The script makes a GPT disk with two APFS
+containers: a small one of the "iBoot System Container" type with empty iSCPreboot, xART, Hardware and Recovery
+volumes (without it the boot stops, see Troubleshooting), and the main one, which is Apple's System volume grown to
+size, with Data, Preboot, VM and Update volumes added. The Linux APFS driver then copies the OS cryptex into the
+System volume, the App cryptex into Preboot, and the system's own Data template into Data, one volume mounted at a
+time. Last, the Data volume gets what upstream's `scripts/mk-macvm-disk.sh` gives it on a Mac.
+
+**What the Linux build fetches, and under which licence.** Nothing in this table is stored in this repository. The
+exact revisions are in `tools/cloud/vm/build-disk-linux.lock`.
+
+| What | Revision | Licence | Used for |
+|---|---|---|---|
+| [macOS-DroidVM](https://github.com/Droid-VM/macOS-DroidVM) | commit `524d27b` | **none stated**: the repository has no licence file | Its range fetcher (`macos-inputs.py`, `macos-fetch-member.py`) and its offline APFS tools (`make-macos-disk.py`, `apfs-add-volumes.py`, `grow-data-store.py`). |
+| [linux-apfs-rw](https://github.com/linux-apfs/linux-apfs-rw) | commit `0318712` | GPL-2.0-only | The kernel module `apfs.ko`, built for the running kernel and loaded while the disk is built. |
+| [apfsprogs](https://github.com/linux-apfs/apfsprogs) | commit `1bd1c1c` | GPL-2.0-only | `mkapfs`, for the new volumes. |
+| [ipsw](https://github.com/blacktop/ipsw) | release 3.1.749, checked by SHA-256 | MIT | Decrypting the two encrypted members. |
+| macOS 27.2 (26B123) restore image | Apple's update server; manifest SHA-256 pinned by macOS-DroidVM | Apple's software licence | The system itself. See the note at the top of this guide. |
+
+Because macOS-DroidVM states no licence, this repository copies none of its code. The script downloads it to your
+VM at the pinned commit and runs it there, unchanged on disk. Three things are adjusted from outside at run time, and
+`tools/cloud/vm/disk_linux.py` explains each: which volumes it adds to the main container, extended attributes in
+its `rsync` calls, and a stand-in for `unshare` on hosts that forbid unprivileged user namespaces. Whether running
+code that has no stated licence suits you is your decision.
+
+**The GPU bundle.** `XnuCpuMetal.bundle` is built from open source: this repository's plugin and bridge
+(GPL-2.0-or-later), metal2vulkan (GPL-2.0-or-later or LGPL-3.0-or-later), Mesa's lavapipe (MIT), LLVM (Apache-2.0 with
+the LLVM exception) and the Khronos Vulkan loader (Apache-2.0). It contains no Apple library. Building it needs
+Apple's macOS SDK (headers and library stubs), on a Mac or on Linux.
+
+Three bundles were run on a Linux-built disk here:
+
+| Bundle | How it was built | What it was run for |
+|---|---|---|
+| Mac build, with the Venus library | `tools/cloud/mac/build-disk.sh gpu` | 7 boots (one failed, see Troubleshooting) and a 48-minute run; it is also the bundle of the Mac-built disk, with many hours of use |
+| Prebuilt bundle (not published) | on a Mac, both architectures from source, path-clean, stripped, no Venus library | 4 boots, a 25-minute run with applications opened and closed, `tests/hosted` |
+| Linux build | `tools/cloud/vm/build-gpu-bundle-linux.sh`, on the VM | 2 boots (one with the bundle from the script as published), a 14-minute run with applications opened and closed, `tests/hosted` |
+
+With each of them the window server, an arm64e program of Apple's, loaded the four files of the bundle, the desktop
+and application windows were drawn, and no crash report was written for the window server or the icon service.
+
+How the Linux build works: the distribution's clang 21 compiles for `arm64-apple-macos` and `arm64e-apple-macos`
+against the SDK. LLVM's own linker (`ld64.lld`) links the arm64 half, but it cannot link arm64e (it has no
+authenticated-pointer relocations), and a plain Linux build of Apple's linker cannot read the SDK's `.tbd` stubs. So
+the script builds Apple's open-source `ld64` from cctools-port together with apple-libtapi, the pairing osxcross uses.
+Rust builds the bridge (stable for arm64; nightly with `-Zbuild-std` for arm64e, then the same symbol renames and
+branch rewrite as on a Mac). LLVM and Mesa are cross-built with the options of the Mac scripts. Where the Mac build
+runs `codesign`, the linkers' own ad-hoc signatures are kept and refreshed by `tools/cloud/vm/macho-adhoc-resign.py`.
+
+What the Linux build fetches besides the sources `gpu/xnu-cpu-metal/scripts/fetch-sources.sh` already names (all
+pinned in `tools/cloud/vm/build-disk-linux.lock`):
+
+| What | Revision | Licence |
+|---|---|---|
+| [cctools-port](https://github.com/tpoechtrager/cctools-port) (Apple's cctools and ld64 for Linux) | commit `e101a69` | APSL-2.0, parts GPL-2.0-or-later |
+| [apple-libtapi](https://github.com/tpoechtrager/apple-libtapi) | branch 1300.6.5, commit `46e03a9` | University of Illinois/NCSA open source licence |
+| Rust toolchains, through rustup | 1.100.0 and nightly-2026-11-24 | MIT OR Apache-2.0 |
+| Vulkan-Headers | tag `vulkan-sdk-1.4.363.0` | Apache-2.0 OR MIT |
+
+Limits of the Linux build as tested: it was built once, on the VM of section 1 (Ubuntu 26.04, clang 21.1.8, SDK 26.1), and
+used for about twenty minutes. Three of the script's stages (`sources`, `bridge`, `llvm`) were run as the same
+commands by hand before the script existed; the script has not been run from nothing in one go. Its bundle is not
+stripped and its files contain the paths of the build folder: fine on your own VM, not something to pass on. The
+graphics tests under `gpu/xnu-cpu-metal/test` were not run against it.
+
+## 8. Alternative: build the disk on a Mac
+
+This is the older route. Use it when you want a disk installed by Apple's own installer, or one with developer tools
+or other applications already on it. It needs an Apple silicon Mac for a few hours (macOS 27, about 80 GB free, not
+itself a virtual machine), a download of about 25 GB, and a transfer of about 30 GB to the VM (section 9). If you
+built the disk in section 7, skip to section 10.
 
 Everything in this section runs on the **Mac**. Copy `tools/cloud/mac/` there (or clone the repository) and work in
 that folder. `build-disk.sh --help` lists the stages and settings.
@@ -338,7 +575,7 @@ that folder. `build-disk.sh --help` lists the stages and settings.
 
 The image contains macOS. **Do not publish it or put it in storage others can read.**
 
-## 8. Move the disk to the VM
+## 9. Move a Mac-built disk to the VM
 
 The three files must end up in one folder on the VM. This guide uses `/var/tmp/macimg`.
 
@@ -387,7 +624,7 @@ ls -ls /var/tmp/macimg/        # mac.img, mac.conf, trustcache.bin
 cat /var/tmp/macimg/mac.conf   # ROOT_UUID=... BOOT_UUID=... MACOS=27.2
 ```
 
-## 9. Boot and stop
+## 10. Boot and stop
 
 1. **Laptop.** Boot the image and wait 100 seconds:
 
@@ -419,7 +656,7 @@ cat /var/tmp/macimg/mac.conf   # ROOT_UUID=... BOOT_UUID=... MACOS=27.2
 To boot again after a VM restart, run step 1 again. To have it start with the VM, see `scripts/install-service.sh`
 (not tried on this host).
 
-## 10. Reach the hosted system
+## 11. Reach the hosted system
 
 Set `GUEST_KEY` and `GUEST_PASSWORD_FILE` in `tools/cloud/cloud.env` on your laptop. The guest gets its address from
 the VM by DHCP; the tools look it up.
@@ -432,7 +669,7 @@ the VM by DHCP; the tools look it up.
 
   Expected: `ProductName: macOS`, `ProductVersion: 27.2`, `BuildVersion: 26B123`. Keep lines short; the console is slow.
 
-- **ssh** (needs `EXTRAS=1` in section 7). It jumps through the VM:
+- **ssh** (needs `--ssh-key` in section 7, or `EXTRAS=1` in section 8). It jumps through the VM:
 
   ```sh
   tools/cloud/guest-ssh 'sw_vers -productVersion; whoami'      # expect: 27.2 and xnu
@@ -453,7 +690,8 @@ the VM by DHCP; the tools look it up.
 
   Coordinates are pixels on the 1280×800 screen. There is no acknowledgement: take a screenshot to see the effect.
 
-- **Logging in at a login or lock window.** The disk logs in automatically at boot. But if the window server crashes,
+- **Logging in at a login or lock window.** The disk logs in automatically at boot (unless it was built with
+  `--autologin off`). But if the window server crashes,
   the session ends at a login window, and there is nobody to type. Do it from the laptop:
 
   1. `tools/cloud/guest-screenshot now.png`, and look at it. You must see the password field.
@@ -472,10 +710,14 @@ the VM by DHCP; the tools look it up.
   Then connect to `vnc://localhost:5900` as `xnu`. The server offers only Apple's authentication types, so a generic
   VNC client will not connect. Only the protocol handshake was checked here, not a full session.
 
-## 11. Tuning for CPU rendering
+## 12. Tuning for CPU rendering
 
 With `GPU=off` the window server alone takes about one CPU while the screen is changing. These changes were applied
 inside the guest and kept. They can all be undone. **The gain was not measured**: no before-figure was taken.
+
+**A disk built on Linux (section 7) has all of this already**, unless you passed `--tuning off`: the script writes
+the same settings into the disk before the first boot. Do only the check at the end of this section. The commands
+below are for a Mac-built disk.
 
 **Guest**, as root (`sudo -S` over `guest-ssh`, or the console):
 
@@ -502,7 +744,7 @@ defaults write com.apple.Accessibility ReduceMotionEnabled -bool true
 These three lines are the settings that were applied, but the exact command lines were not kept; check them in System
 Settings, Accessibility, Display if they do not take.
 
-Then reboot the hosted system (section 9). Check: `launchctl print-disabled system | grep -c 'disabled'` is 14 or
+Then reboot the hosted system (section 10). Check: `launchctl print-disabled system | grep -c 'disabled'` is 14 or
 more, and `top -l 2 | grep 'CPU usage' | tail -1` shows about 90 % idle a few minutes after login (the first sample of `top` is not meaningful).
 
 Two cautions from experience:
@@ -512,7 +754,7 @@ Two cautions from experience:
   (Troubleshooting, "widgets crash at login").
 - `softwareupdated` kept running although disabled.
 
-## 12. Check the result
+## 13. Check the result
 
 Run these from the **laptop** and compare:
 
@@ -524,7 +766,9 @@ tools/cloud/guest-screenshot check.png                                        # 
 tools/cloud/boot-cycle.sh 0 check                                             # dock=up ... crash-reports: ...
 ```
 
-The pointer-authentication fix (needs `clang` in the guest):
+The pointer-authentication fix. It needs `clang` in the guest. A disk built on Linux has no compiler: build the four
+test programs elsewhere and pass their folder, as [`tests/hosted/README.md`](../tests/hosted/README.md) describes
+(`sh ~/xt/hosted/run.sh FOLDER`).
 
 ```sh
 tar -C tests -cf - hosted | tools/cloud/guest-ssh 'rm -rf ~/xt && mkdir ~/xt && tar -C ~/xt -xf - && sh ~/xt/hosted/run.sh'
@@ -535,7 +779,7 @@ Expected last line: `hosted tests: pass`. Details: [`tests/hosted/README.md`](..
 The renderer fix has its own test, a plain Vulkan program that is built on the Mac against the lavapipe from the GPU
 bundle build: [`tests/lavapipe/README.md`](../tests/lavapipe/README.md). Expected last line: `RESULT: PASS`.
 
-## 13. Measured numbers
+## 14. Measured numbers
 
 All on the C4A VM described in section 1, hosted macOS 27.2 with 3 CPUs, CPU rendering.
 
@@ -571,7 +815,7 @@ one CPU at idle. A faster path for user space was judged not worth building.
 | plain `arm64` | all four off | IA off, IB **on**, DA off, DB **on** | all four off |
 | `arm64e` | all four on | all four on | all four on |
 
-## 14. Troubleshooting
+## 15. Troubleshooting
 
 Each entry: what you see, why, what to do. All of these happened.
 
@@ -633,11 +877,75 @@ Fix: check that `/var/tmp/mac.conf` is the one that came with `mac.img`.
 Cause: the collection was patched for the wrong platform version. The script's default is 26 (for a 27.0.1 disk).
 Fix: `AMFI_PLATFORM=27 bash scripts/vm-xnu-rebuild.sh`.
 
+### Linux disk build
+
+**The hosted system panics during boot. The log has `get_apfs_node: Timed out waiting for node with role 5 on
+69646961-6700-11AA-AA11-00306543ECAC`, `mount_phase_one: xART volume mount failed - error 49154` and `Boot task failed:
+mount-phase-1 - exited due to SIGABRT`.**
+Cause: the disk has one APFS container only. launchd's first mount phase looks for the xART volume in the container of
+a GPT partition whose type is "iBoot System Container" (the GUID in the message), as on every installed Apple
+silicon disk. macOS-DroidVM's own disk layout keeps xART in the main container and marks it in its own disk driver,
+which xnulinux does not have. The first Linux-built disk here, made with that layout, stopped exactly there.
+Fix: a second, small container of that partition type with iSCPreboot, xART, Hardware and Recovery volumes, all
+empty. `build-disk-linux.sh` makes it (500 MiB, the disk's first partition). If you see this panic, the disk was not
+made by that script, or its first partition is damaged: `sgdisk -p mac.img` must list `iBootSystemContainer`.
+
+**`ConnectionResetError: [Errno 104] Connection reset by peer`, often followed by `zipfile.BadZipFile: File is not
+a zip file`, while reading the restore image.**
+Cause: Apple's server drops a connection now and then; macOS-DroidVM's fetch tools do not retry the first read.
+Fix: nothing to do. The script retries (up to 8 times for the manifest, 12 for a member) and prints `try N failed`.
+Parts already fetched are kept. It happened in two of two full runs here.
+
+**`unshare: write failed /proc/self/uid_map: Operation not permitted`.**
+Cause: macOS-DroidVM runs `mkapfs` in a user namespace, and Ubuntu forbids unprivileged user namespaces.
+Fix: handled. The script detects it and runs that one command with `sudo` instead.
+
+**`ValueError: path must stay within .../macOS-DroidVM`, or `refusing to overwrite .../inventory`.**
+Cause: macOS-DroidVM's tools only accept paths inside their own folder, and its inventory tool wants a folder that
+does not exist yet.
+Fix: handled. The script keeps Apple's files inside the fetched tree (`WORK/macOS-DroidVM/artifacts/`). You only meet
+these messages when you call those tools by hand.
+
+**`build-disk-linux: sudo asks for a password` (exit status 3).**
+Cause: the script uses `sudo -n` and never prompts.
+Fix: give the VM user passwordless sudo (cloud images usually have it), or run it as a user that has it.
+
+**The macOS kernel log has, for the System, Data and Preboot volumes at every boot,
+`sanity_check_alloced_blocks: ... fs_alloc_count mismatch: ... udata: N fs_alloc_count A != count C`.**
+Cause: a bookkeeping difference in the Linux APFS driver. Each volume keeps two running totals, blocks allocated and
+blocks freed. On a volume written by Apple their difference is exactly the number of data blocks; macOS relies on
+that. The Linux driver also adds the tree nodes it allocates and frees to those totals. macOS then counts those nodes
+twice and prints the line. No data is wrong, and macOS never corrects the totals by itself: the first Linux-built
+disk here printed the three lines at every boot.
+Fix: `build-disk-linux.sh` runs `tools/cloud/vm/apfs-alloc-count.py --fix` as its last step. It walks each volume,
+counts the data blocks and sets the "allocated" total to match. After it: 0 such lines in each of the 8 boots whose
+kernel log was read. To check a disk
+that is not booted: `python3 tools/cloud/vm/apfs-alloc-count.py --offset $((501 << 20)) mac.img`.
+
+**A boot ends after a few seconds. The log has `[Event: fsck] posix_spawn(): 14: Bad address` and
+`userspace panic: boot task failure: fsck - posix_spawn: 14: Bad address`.**
+Cause: unknown. launchd's very first program start of the boot failed, and launchd stops the system on purpose when a
+boot task fails. It happened on one boot of 14 of the Linux-built disk. The disk had not changed since the boot
+before and checked clean; the next boot of the same disk was normal. Compile jobs were running on the VM at the
+time, as they were during other boots that worked. Whether it is tied to the Linux-built disk or to the host being
+busy was not established.
+Fix: stop the run (`scripts/xnulinux-boot.sh stop`) and boot again. `boot-image.sh` reports this case with exit
+status 1 and the panic line.
+
+**The screen is black after the first boot of a new disk, although the root shell answers.**
+Cause: the first boot builds caches. The login window or desktop appeared about two minutes after boot, and the load
+average stayed above 100 for about five minutes.
+Fix: wait. Check with `tools/cloud/guest-ssh uptime` rather than by sending input.
+
+**apfsprogs' `apfsck` stops on the image with `Resource compressed file: block metadata is too big`.**
+Cause: a limit of that checker on some of Apple's compressed files. It says nothing about the disk.
+Fix: check from inside the booted guest instead: `fsck_apfs -n -l /dev/disk2s1` (and `s2`, `s3`).
+
 ### Mac
 
 **`tart create` ends with "The virtual machine failed to start".**
 Cause: the user has no desktop session (nobody logged in at the screen).
-Fix: automatic login and a reboot (section 7 step 1).
+Fix: automatic login and a reboot (section 8 step 1).
 
 **`brew install cirruslabs/cli/tart` no longer works.**
 Cause: tart moved to another Homebrew tap, and Homebrew ignores a third-party tap until it is trusted.
@@ -701,10 +1009,10 @@ That the crashes stop was not verified afterwards.
 
 **`cryptexd` crashes in a loop; `locationd` crashes at boot.**
 Cause: not investigated. Both depend on things the hosted system does not have.
-Fix: disable them (section 11).
+Fix: disable them (section 12).
 
 **The session is at a login window and nothing can type.**
-Fix: section 10, "Logging in at a login or lock window".
+Fix: section 11, "Logging in at a login or lock window".
 
 **A permission prompt for "sshd-keygen-wrapper" appears.**
 Cause: something run over ssh used automation (for example `osascript` talking to System Events).
@@ -721,7 +1029,7 @@ Pointer authentication works all the same. Not investigated.
 Harmless. The first is XNU decoding this CPU's cache registers wrongly (the line size is right). The others are by
 design: Linux owns the interrupt controller.
 
-## 15. What does not work, and what was not tested
+## 16. What does not work, and what was not tested
 
 Does not work or is missing:
 
@@ -735,6 +1043,10 @@ Does not work or is missing:
   one build.
 - **A Spotlight indexing extension of the voice-memo app** crashes; `AppleKeyStoreUserClient failed MACF` messages from
   three daemons continue. Not investigated.
+- **On a Linux-built disk (section 7):** no developer tools, no Recovery system, no Intel support; files written by
+  Linux are uncompressed and lack BSD file flags. The list is in section 7.
+- **The Linux build of the GPU bundle is new.** It was built once and used for about twenty minutes (section 7,
+  "The GPU bundle"). The Mac-built bundle is the one with hours of use.
 - **A chess game crashed twice** (`EXC_ARM_DA_ALIGN` in a texture upload) before the two fixes and not in three tries
   after. The cause was never established.
 
@@ -743,21 +1055,41 @@ Not tested:
 - **This exact branch, end to end.** The system described here was built from upstream at commit `06bc271` plus local
   patches. The two fixes are the same changes in upstream's form, the fixed renderer was rebuilt from that form, and
   the build-script fixes were applied by hand on the VM in an earlier shape. A fresh VM built from `cloud-arm` from
-  the first step has not been done.
-- **The helper tools in their cleaned form.** Each tool's header says whether it was run or only syntax-checked. Most
-  were only syntax-checked; their private originals did the work.
-- **Restoring a saved image on a new VM** (section 16).
+  the first step has not been done. The Linux disk build of section 7 was run from this branch's files, on the VM
+  that already had the kernel side.
+- **The Linux disk build beyond what is listed here.** Tested: one disk of 120 GiB, macOS 27.2 (26B123), on the VM of
+  section 1. 14 boots, one of which failed without an explanation; the login window with `--autologin off`, logged
+  in with the input tools; changing options on the existing disk five times (only the last two stages ran); a
+  48-minute run and two shorter ones with Safari, Calculator, System Settings, Terminal and Finder windows opened and
+  closed over ssh; ssh; the Screen Sharing handshake; `tests/hosted`; three different GPU bundles. Not tested: other
+  sizes (an earlier form of the same steps built 48 GiB), `--tuning off`, `--ssh off`, another user name, other
+  macOS builds, other hosts, days of uptime, filling the disk, saving and restoring it (section 17), and
+  `--install-deps` actually installing something.
+- **A clean bill from Apple's `fsck_apfs` for a used Linux-built disk.** Run in the guest (`fsck_apfs -n -l`), it
+  reports System and Preboot as OK. For the Data volume of the test disk it ended with "could not be verified
+  completely", three times: reference counts of some extents, the block count, the size statistics of three folders,
+  and four cache files marked as compressed without their compression attribute. The four files were damaged by a
+  step of an earlier version of the staging script when it was run again on the used disk; that step is gone. The
+  folder statistics are a likely result of Linux writing into folders macOS keeps statistics for. The extent warnings
+  are not explained: checked from the VM after a sync and a stop, the same volume had no extent without an owner
+  three times and two small ones (14 blocks) twice. On the first Linux-built disk (staged once, booted twice) and on
+  the Mac-built disk, Data checked OK. **Not tested: this check on a Linux-built disk that was staged only once and
+  then used for a while.** Nothing was seen to go wrong in use.
+- **The helper tools in their cleaned form.** Each tool's header says whether it was run or only syntax-checked. Run
+  as published: `vm-ssh`, `vm-run`, `guest-ssh`, `guest-screenshot`, `boot-cycle.sh`, `vm/boot-image.sh` and the
+  three files of the Linux disk build. The others were only syntax-checked; their private originals did the work.
+- **Restoring a saved image on a new VM** (section 17).
 - **More than 3 hosted CPUs**, other VM sizes, other clouds, other CPUs, a 16 KB-page host kernel.
 - **Running as a service** (`scripts/install-service.sh`) on this host.
 - **A full Screen Sharing session**; only the handshake.
 - **Long uptimes and load.** The longest runs were hours, not days. No stress run like upstream's was done here.
 - **Which of the three parts of the renderer patch** is needed. The crash dump points at the first.
 
-## 16. Saving your work
+## 17. Saving your work
 
 Once the hosted system is set up, save the image and the kernel side, so a deleted VM is not a lost afternoon.
 
-1. Stop the hosted system (section 9).
+1. Stop the hosted system (section 10).
 2. **Laptop.**
 
    ```sh
@@ -768,7 +1100,7 @@ Once the hosted system is set up, save the image and the kernel side, so a delet
 
    Expected: `READBACK-OK ...`, then for each relay `relay: OK ... all NN parts match the VM's MD5`. Here a 29 GB
    image packed in 226 s and uploaded in 148 s.
-3. Boot again (section 9), and delete the staging folder `/var/tmp/up` on the VM when the upload is verified.
+3. Boot again (section 10), and delete the staging folder `/var/tmp/up` on the VM when the upload is verified.
 
 `save1k` holds the built kernel collection, the modules (built for the host kernel that was running), `kc27.bin`, the
 settings file and the kernel command line. Both archives contain Apple's files: private storage only. Restoring them
