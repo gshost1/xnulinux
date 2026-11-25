@@ -1093,7 +1093,7 @@ Not tested:
   had used it. **A disk that was staged once and then used gets a clean bill:** after 14 boots and a two-hour run,
   `fsck_apfs -n -l` said "appears to be OK" without a single warning for all nine volumes, four times over (also
   after a clean stop and a new boot, and with applications open); the Mac-built disk gives the same answer for its
-  twelve volumes, and so does a real Mac. So the warnings belong to re-staging a used disk, which this guide advises
+  twelve volumes (one run, five minutes after a boot), and so does the Data volume of a real Mac. So the warnings belong to re-staging a used disk, which this guide advises
   against. The check runs on the live system only; a check of the unmounted volumes from a second macOS was not done.
 - **The helper tools in their cleaned form.** Each tool's header says whether it was run or only syntax-checked. Run
   as published: `vm-ssh`, `vm-run`, `guest-ssh`, `guest-screenshot`, `boot-cycle.sh`, `vm/boot-image.sh` and the

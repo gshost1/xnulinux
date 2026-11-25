@@ -94,7 +94,7 @@ Do not start a phase until the user has answered what that phase needs. Ask ever
 |---|---|---|
 | B: kernel build | tens of minutes (55 minutes of VM time including retries, the first time) | `ENDED` and the phase check passes |
 | D: disk on the VM | 5.5 to 6.5 minutes from nothing (132 to 173 s download, 183 to 196 s image) | `grep -c "disk ready in" ~/disk.log` prints 1, and the phase check passes |
-| D: GPU bundle on the VM | about 1.5 hours on 4 CPUs (LLVM twice, 29 minutes each with 4 jobs; the rest about 30 minutes) | `grep -c "bundle ready" ~/gpu.log` prints 1 |
+| D: GPU bundle on the VM | about 1.5 hours on 4 CPUs (88 and 78 minutes measured; LLVM, compiled twice, is about an hour of it) | `grep -c "bundle ready" ~/gpu.log` prints 1 |
 | D: GPU bundle on a Mac (`gpu`), instead | not measured for a first build (it builds LLVM); 8 minutes for a rebuild with the disk | `~/xnubuild/logs/gpu.log` ends in `gpu stage done` |
 | D-mac: guest install (`vm`) | not measured: a 25 GB download plus Apple's installer | `~/xnubuild/logs/vm.log` ends in `vm stage done` |
 | E-mac: pack, upload, pull | 40 s + 206 s + about 10 minutes for 23 to 28 GB | each tool's `OK` or `pulled in` line |
