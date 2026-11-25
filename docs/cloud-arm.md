@@ -305,8 +305,8 @@ is missing). `--help` says exactly which commands run as root.
 
    - **Build it on the VM.** No Mac. It needs the macOS SDK that section 4 left in
      `~/w/dvm/toolchains/sdks/MacOSX26.1.sdk` (Apple's files, fetched there from a third-party mirror, as section 4
-     says), about 15 GB of disk, and time: LLVM is compiled twice, 29 minutes each with 4 jobs on an otherwise idle
-     VM; everything else takes about 30 minutes.
+     says), about 12 GB of disk, and time: 88 minutes when measured, with 4 jobs on the 4-vCPU VM of section 1
+     while a hosted macOS was running on it. LLVM, compiled twice, was 68 of them; everything else 20.
 
      ```sh
      cd ~/w/poc
@@ -499,11 +499,14 @@ pinned in `tools/cloud/vm/build-disk-linux.lock`):
 | Rust toolchains, through rustup | 1.100.0 and nightly-2026-11-24 | MIT OR Apache-2.0 |
 | Vulkan-Headers | tag `vulkan-sdk-1.4.363.0` | Apache-2.0 OR MIT |
 
-Limits of the Linux build as tested: it was built once, on the VM of section 1 (Ubuntu 26.04, clang 21.1.8, SDK 26.1), and
-used for about twenty minutes. Three of the script's stages (`sources`, `bridge`, `llvm`) were run as the same
-commands by hand before the script existed; the script has not been run from nothing in one go. Its bundle is not
-stripped and its files contain the paths of the build folder: fine on your own VM, not something to pass on. The
-graphics tests under `gpu/xnu-cpu-metal/test` were not run against it.
+Limits of the Linux build as tested: the script was run from nothing in one go once, from a fresh clone into an empty
+work folder, on the VM of section 1 (Ubuntu 26.04, clang 21.1.8, SDK 26.1) after section 4 had installed its
+packages there: 88 minutes, no manual step. The bundle of that run was checked on the VM (the four files are
+universal arm64 + arm64e and their signatures are intact) but not booted when this was written. A bundle made earlier
+by the same stages, run one at a time, is the one that was booted, and it was used for about twenty minutes. The
+bundle is not stripped, and one of its files (`libxnu_m2v.dylib`) contains the paths of the build folder, 926 times
+when counted: fine on your own VM, not something to pass on. The graphics tests under `gpu/xnu-cpu-metal/test` were
+not run against it.
 
 ## 8. Alternative: build the disk on a Mac
 

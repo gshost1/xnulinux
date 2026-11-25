@@ -7,7 +7,7 @@
 #   build-gpu-bundle-linux.sh --out DIR [--work DIR] [--sdk DIR] [--jobs N] [STAGE...]
 #
 #   --out DIR    where XnuCpuMetal.bundle goes (give DIR/XnuCpuMetal.bundle to build-disk-linux.sh --gpu-bundle)
-#   --work DIR   sources and build trees, about 15 GB [XNU_GPU_WORK, default OUT-work]
+#   --work DIR   sources and build trees, 11 GB when measured [XNU_GPU_WORK, default OUT-work]
 #   --sdk DIR    a macOS SDK (headers and .tbd stubs) [XNU_GPU_SDK, default ~/w/dvm/toolchains/sdks/MacOSX26.1.sdk, where
 #                scripts/vm-xnu-build.sh leaves the one it fetches]. The SDK is Apple's; this script does not fetch it.
 #   --jobs N     parallel compile jobs [XNU_GPU_JOBS, default: the number of CPUs]
@@ -24,8 +24,8 @@
 #   loader     the Khronos Vulkan loader, both architectures.
 #   bridge     libxnu_m2v.dylib: Rust (rustup, into WORK) for arm64; nightly with -Zbuild-std, the symbol renames and
 #              scripts/rust-pac-rewrite.py for arm64e.
-#   llvm       LLVM's static libraries, both architectures, and three native helper programs. The long stage: about 2,230
-#              compile steps for each architecture (29 minutes each with 4 jobs on 4 Neoverse V2 cores).
+#   llvm       LLVM's static libraries, both architectures, and three native helper programs. The long stage: 2,223
+#              compile steps for each architecture (68 minutes for both in the full run described under Status).
 #   lavapipe   Mesa's lavapipe against them, both architectures.
 #   bundle     the plugin itself, the universal files, the bundle folder.
 #
@@ -33,10 +33,14 @@
 # No sudo. Nothing is installed outside WORK. Exit: 0 done, 1 a stage failed (its log is WORK/logs/STAGE.log), 2 wrong
 # usage or a missing input, 3 this host lacks a tool.
 #
-# Status: new. On Ubuntu 26.04 arm64 (clang 21.1.8, SDK 26.1) the stages preflight, linker, loader, lavapipe (arm64
-# half) and bundle ran in this form, and the bundle they made booted the hosted macOS 27.2 to a desktop. The stages
-# sources, bridge and llvm, and the arm64e half of lavapipe, ran as the same commands by hand, not through this
-# script; the script has not been run from nothing in one go. Not tested: other hosts, other SDKs, hours of use.
+# Status: new. Run from nothing in one go once, from a fresh clone into an empty work folder, on Ubuntu 26.04 arm64
+# (clang 21.1.8, SDK 26.1; 4 Neoverse V2 vCPUs, 4 jobs, a hosted macOS running on the same VM): 88 minutes with no
+# manual step (sources 83 s, linker 268 s, loader 8 s, bridge 649 s, llvm 4092 s, lavapipe 150 s, bundle 9 s), and the
+# same command again skipped every stage. That run's bundle was checked on the host: the four files are universal
+# arm64 + arm64e and their signatures' page hashes are right. It was not booted when this was written; a bundle made
+# earlier by the same stages, run one at a time, booted the hosted macOS 27.2 to a desktop. Also run: a stage stopped
+# in the middle and started again (lavapipe), with the same bytes as a result. The host had the packages of
+# scripts/vm-xnu-build.sh. Not tested: a host without them, other hosts, other SDKs, hours of use.
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); REPO=$(cd "$HERE/../../.." && pwd)
 PROG=build-gpu-bundle-linux; STAGES="preflight sources linker loader bridge llvm lavapipe bundle"
