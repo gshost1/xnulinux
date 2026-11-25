@@ -7,7 +7,7 @@
 #   build-disk-linux.sh --out DIR --gpu-bundle DIR --password-file FILE [options] [STAGE...]
 #
 # Required:
-#   --out DIR             where the disk goes (mac.img is sparse: about 24 GB on disk whatever its size)
+#   --out DIR             where the disk goes (mac.img is sparse: about 22 GB on disk whatever its size)
 #   --gpu-bundle DIR      a built XnuCpuMetal.bundle (the CPU Metal plugin; see docs/cloud-arm.md for where to get one)
 #   --password-file FILE  the hosted user's password on its first line. It must be readable only by its owner or by
 #                         root. It is read by a root process; it is never printed and never on a command line.
@@ -29,7 +29,7 @@
 #
 # Stages, in order; with none named, all run. Each is skipped when it is done and its check still passes, so a run that
 # stopped can simply be started again with the same options.
-#   preflight  looks at the host and the three required inputs. Changes nothing (without --install-deps).
+#   preflight  looks at the host and the three required inputs. Changes nothing (without --install-deps). Always runs.
 #   deps       fetches macOS-DroidVM, the Linux APFS driver, its tools and ipsw at the revisions in build-disk-linux.lock,
 #              builds mkapfs and apfs.ko for the running kernel.
 #   inputs     fetches six members of Apple's restore image by HTTP ranges (13.8 GB of 25.6 GB), checks them against
@@ -48,9 +48,11 @@
 # Exit: 0 done, 1 a stage or its check failed, 2 wrong usage or a missing or unreadable input, 3 this host cannot do it.
 # Errors go to stderr and say what to fix. Each stage's full output is in WORK/logs/STAGE.log.
 #
-# Status: run end to end on Ubuntu 26.04 arm64 (kernel 7.0, 4 KB pages) for macOS 27.2 (26B123) with --size-gib 120,
-# and the result booted. Not exercised: --install-deps actually installing something (the host had every package),
-# other sizes (an earlier form of the same steps built 48 GiB), other macOS builds, other hosts.
+# Status: run end to end on Ubuntu 26.04 arm64 (kernel 7.0, 4 KB pages) for macOS 27.2 (26B123) at the default size
+# and with --size-gib 120, and the results booted. Also run with a boot each: --tuning off, --autologin off, --ssh off
+# (the key is still written to authorized_keys), another --user, a second disk from an existing work folder, and
+# --install-deps installing a package that was missing (gdisk). Not exercised: other sizes, --screen-sharing on at the
+# default size, other macOS builds, other hosts.
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PROG=build-disk-linux
@@ -294,7 +296,9 @@ in_use() {	# is a running hosted system using this image? (xnu.ko's disk= parame
 need_inputs
 for s in $STAGES; do
   case " $RUN " in *" $s "*) ;; *) continue;; esac
-  if [ "$s" != finish ] && [ "${FORCE#* $s }" = "$FORCE" ] && "check_$s"; then say "$s: already done, skipped"; continue; fi
+  # preflight and finish always run: preflight looks at the host as it is now (a tool removed since the last run, or
+  # --install-deps given for the first time, must not be hidden by an old done-mark), and it takes a second
+  if [ "$s" != finish ] && [ "$s" != preflight ] && [ "${FORCE#* $s }" = "$FORCE" ] && "check_$s"; then say "$s: already done, skipped"; continue; fi
   if [ "$s" != preflight ] && [ "$s" != deps ] && ! check_deps; then die "stage $s needs the tools: run the deps stage first" 1; fi
   case "$s" in image|stage|finish) check_inputs || die "stage $s needs Apple's inputs: run the inputs stage first" 1;; esac
   case "$s" in stage|finish) [ -s "$OUT/mac.img" ] || die "stage $s needs $OUT/mac.img: run the image stage first" 1;; esac
