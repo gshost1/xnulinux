@@ -8,8 +8,8 @@
 # It STOPS AND STARTS the hosted system: do not run it while anything else uses it. Each cycle takes about
 # OBSERVE_SECONDS plus two minutes.
 # Exit: 0 all cycles recorded, 1 a boot did not reach the Dock, 2 wrong usage.
-# Status: only syntax-checked in this cleaned form, except the per-boot check, which was run read-only on the live
-# system. The private original counted the dumps of a debugging build of the renderer instead of crash reports.
+# Status: run in this form: four reboots with a 180 s observation each, and the read-only check (N=0). The private
+# original counted the dumps of a debugging build of the renderer instead of crash reports.
 . "$(dirname "$0")/lib.sh"
 [ "${1:-}" = --help ] || [ "${1:-}" = -h ] && { show_help; exit 0; }
 [ $# -ge 2 ] || usage_error "usage: boot-cycle.sh N LABEL [observe-seconds]"

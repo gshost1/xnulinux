@@ -7,7 +7,8 @@
 # Commands: move X Y, click [X Y], rclick [X Y], drag X1 Y1 X2 Y2, scroll N, type TEXT, key NAME..., sleep SECONDS.
 # Everything given here appears in process listings on both machines: never type a password with it, use guest-login.
 # Exit: 0 sent (the input queue has no acknowledgement: check with guest-screenshot), 1 failed, 2 wrong usage.
-# Status: only syntax-checked in this cleaned form; the private original clicked, typed and sent key chords.
+# Status: a click was sent with this cleaned form (exit 0, no visible check); the private original clicked, typed and
+# sent key chords.
 . "$(dirname "$0")/lib.sh"
 [ "${1:-}" = --help ] || [ "${1:-}" = -h ] && { show_help; exit 0; }
 [ $# -ge 1 ] || usage_error "no input command given"
