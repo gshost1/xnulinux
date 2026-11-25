@@ -87,8 +87,8 @@ says the rest.
 
 - The bucket tools speak Google Cloud Storage (`gcloud storage`, resumable upload URLs). Another object store needs the
   three `gcloud`/`curl` places changed; `build-disk.sh upload` and plain `scp` need no bucket at all.
-- `vm/build-disk-linux.sh` downloads macOS-DroidVM to the VM and runs it. That repository states no licence, so
-  nothing of it is in this one; see the guide, "What the Linux build fetches".
+- `vm/build-disk-linux.sh` downloads macOS-DroidVM to the VM and runs it. Its author allows use with attribution
+  (its issue #3); nothing of it is copied into this repository. See the guide, "What the Linux build fetches".
 - The image parts, the kernel-side archive and the backups **contain Apple's files**. Keep them in storage only you can
   read. Nothing in this repository contains them.
 - `guest-input` arguments are visible in process lists. Passwords go through `guest-login` only.
