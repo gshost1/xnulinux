@@ -150,7 +150,9 @@ do_bridge() {
   A=target/arm64e-apple-darwin/release/libxnu_m2v.a
   [ -s "$A" ] || { err "the arm64e bridge library did not build"; return 1; }
   # from here: scripts/build-m2v-arm64e.sh steps 2 to 6
-  rm -rf "$W" && mkdir -p "$W/objs" "$W/bin" || return 1
+  # The library is made in $W/new and moved into place only after the rewrite and the signature, so that a run stopped in
+  # between does not leave a file that check_bridge takes for a finished one.
+  rm -rf "$W" && mkdir -p "$W/objs" "$W/bin" "$W/new" || return 1
   "$O/cc-arm64e" -O2 -I"$O/vk-headers/include" -c "$G/src/AdrenoMetal/bridge/RustPacBoundary.c" -o "$W/RustPacBoundary.o" || return 1
   (cd "$W/objs" && "$L/llvm-ar" x "$G/src/xnu-m2v-bridge/$A") || return 1
   for o in "$W"/objs/*.o; do
@@ -159,10 +161,10 @@ do_bridge() {
       --redefine-sym __Unwind_Backtrace=_nmb_pac_Unwind_Backtrace --redefine-sym _dlsym=_nmb_pac_dlsym "$o" "$o.tmp" && mv "$o.tmp" "$o" || return 1
   done
   "$L/llvm-ar" rcs "$W/libxnu_m2v_pac.a" "$W"/objs/*.o || return 1
-  "$O/cc-arm64e" -dynamiclib -Wl,-force_load,"$W/libxnu_m2v_pac.a" "$W/RustPacBoundary.o" -liconv -lSystem -install_name @rpath/libxnu_m2v.dylib -o "$W/libxnu_m2v.dylib" || { err "the arm64e bridge did not link"; return 1; }
+  "$O/cc-arm64e" -dynamiclib -Wl,-force_load,"$W/libxnu_m2v_pac.a" "$W/RustPacBoundary.o" -liconv -lSystem -install_name @rpath/libxnu_m2v.dylib -o "$W/new/libxnu_m2v.dylib" || { err "the arm64e bridge did not link"; return 1; }
   ln -sf "$P/bin/aarch64-apple-darwin-nm" "$W/bin/nm"	# rust-pac-rewrite.py calls plain `nm`
-  PATH=$W/bin:$PATH python3 "$G/scripts/rust-pac-rewrite.py" "$W/libxnu_m2v.dylib" || { err "the pointer-authentication rewrite failed"; return 1; }
-  resign "$W/libxnu_m2v.dylib"
+  PATH=$W/bin:$PATH python3 "$G/scripts/rust-pac-rewrite.py" "$W/new/libxnu_m2v.dylib" || { err "the pointer-authentication rewrite failed"; return 1; }
+  resign "$W/new/libxnu_m2v.dylib" && mv "$W/new/libxnu_m2v.dylib" "$W/libxnu_m2v.dylib"
 }
 check_bridge() { [ -s "$G/src/xnu-m2v-bridge/target/aarch64-apple-darwin/release/libxnu_m2v.dylib" ] && [ -s "$O/m2v-arm64e/libxnu_m2v.dylib" ]; }
 do_llvm() {
