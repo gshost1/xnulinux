@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Pinned revisions of everything build-disk-linux.sh fetches. Sourced as shell. Nothing listed here is stored in this
+# repository: it is fetched onto the build host, used there, and stays there.
+#
+# macOS-DroidVM: the range fetcher for Apple's restore image and the offline APFS tools. No licence file at this commit,
+# so its files are only fetched and run, never copied or changed (see docs/cloud-arm.md, "What the Linux build fetches").
+DROIDVM_URL=https://github.com/Droid-VM/macOS-DroidVM.git
+DROIDVM_COMMIT=524d27bf57ae92375aa39e3a81e11727c08973ff
+# The Linux APFS driver (GPL-2.0-only) and its user-space tools (GPL-2.0-only), at the commits macOS-DroidVM pins in
+# configs/sources.lock.json. The script stops if the two files disagree.
+APFS_RW_URL=https://github.com/linux-apfs/linux-apfs-rw.git
+APFS_RW_COMMIT=03187127cd2e62cf78321cdb942eb3a7b17981f9
+APFSPROGS_URL=https://github.com/linux-apfs/apfsprogs.git
+APFSPROGS_COMMIT=1bd1c1c2140d13d1b6d2e03379316572bee70aa3
+# blacktop/ipsw (MIT): decrypts the two encrypted members with the key Apple's key server gives for them.
+IPSW_VERSION=3.1.749
+IPSW_URL=https://github.com/blacktop/ipsw/releases/download/v3.1.749/ipsw_3.1.749_linux_arm64.tar.gz
+IPSW_SHA256=3bfb073f19019eca52ec0f11fe4d35841661393f1a81f92d5089d5973793d034
+# The macOS build: a profile in macOS-DroidVM's configs/ (macos-NAME.json), which pins the restore image's address on
+# Apple's server and the SHA-256 of its manifest. Only this one was tested.
+MACOS_PROFILE=27.2-26B123
