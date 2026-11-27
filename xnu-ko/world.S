@@ -131,6 +131,32 @@ xnu_world_upcall:			/* x0 = stage, called by XNU with blr */
 	mov	x19, x0
 	mov	x20, x1
 	mov	x21, x2
+	add	x11, x9, #472
+	stp	d8,  d9,  [x11, #0]
+	stp	d10, d11, [x11, #16]
+	stp	d12, d13, [x11, #32]
+	stp	d14, d15, [x11, #48]
+	mrs	x10, fpcr
+	str	x10, [x9, #536]
+	/* Non-sleeping IRQ-disabled host calls never touch TTBR0 or schedule Linux tasks: skip TLBI mm switches. */
+	cmp	w0, #841		/* LINUX64_CALL_IPI */
+	b.eq	L_fast_upcall
+	cmp	w0, #817		/* LINUX64_CALL_NET_RECV (no fki_linux_runs) */
+	b.eq	L_fast_upcall
+	cmp	w0, #812		/* LINUX64_CALL_WALLCLOCK */
+	b.eq	L_fast_upcall
+	cmp	w0, #822		/* LINUX64_CALL_RANDOM */
+	b.eq	L_fast_upcall
+	cmp	w0, #821		/* LINUX64_CALL_DISK_SIZE */
+	b.eq	L_fast_upcall
+	cmp	w0, #995		/* LINUX64_CALL_RAMDISK_SIZE */
+	b.eq	L_fast_upcall
+	cmp	w0, #996		/* LINUX64_CALL_CONSOLE_WRITE */
+	b.eq	L_fast_upcall
+	cmp	w0, #998		/* LINUX64_CALL_KPRINTF */
+	b.eq	L_fast_upcall
+	cmp	w0, #840		/* LINUX64_CALL_CPU_START */
+	b.eq	L_fast_upcall
 	/*
 	 * The current XNU thread's user TLS registers: Linux may schedule during the upcall (idle, file I/O), and its
 	 * context switch rewrites TPIDR_EL0 and zeroes TPIDRRO_EL0 (where Darwin user code keeps its TSD pointer).
@@ -157,7 +183,29 @@ xnu_world_upcall:			/* x0 = stage, called by XNU with blr */
 	add	x0, x9, #328		/* load XNU keys */
 	add	x1, x9, #240		/* save Linux keys */
 	bl	fki_pac_swap
+	b	L_upcall_out
+L_fast_upcall:
+	add	x0, x9, #240		/* load Linux keys */
+	add	x1, x9, #328		/* save XNU keys */
+	bl	fki_pac_swap
+	mov	x0, x19
+	mov	x1, x20
+	mov	x2, x21
+	bl	xnu_hook
+	cbnz	x0, xnu_world_abort
 	W(x9)
+	add	x0, x9, #328		/* load XNU keys */
+	add	x1, x9, #240		/* save Linux keys */
+	bl	fki_pac_swap
+L_upcall_out:
+	W(x9)
+	ldr	x10, [x9, #536]
+	msr	fpcr, x10
+	add	x11, x9, #472
+	ldp	d8,  d9,  [x11, #0]
+	ldp	d10, d11, [x11, #16]
+	ldp	d12, d13, [x11, #32]
+	ldp	d14, d15, [x11, #48]
 	ldr	x10, [x9, #208]
 	mov	sp, x10
 	ldp	x19, x20, [x9, #112]
@@ -177,7 +225,7 @@ xnu_world_upcall:			/* x0 = stage, called by XNU with blr */
 	.globl	xnu_fault_tramp
 	.type	xnu_fault_tramp, %function
 xnu_fault_tramp:
-	sub	sp, sp, #256
+	sub	sp, sp, #800
 	stp	x0, x1, [sp, #0]
 	stp	x2, x3, [sp, #16]
 	stp	x4, x5, [sp, #32]
@@ -194,6 +242,26 @@ xnu_fault_tramp:
 	stp	x26, x27, [sp, #208]
 	stp	x28, x29, [sp, #224]
 	str	x30, [sp, #240]
+	stp	q0, q1, [sp, #256]
+	stp	q2, q3, [sp, #288]
+	stp	q4, q5, [sp, #320]
+	stp	q6, q7, [sp, #352]
+	stp	q8, q9, [sp, #384]
+	stp	q10, q11, [sp, #416]
+	stp	q12, q13, [sp, #448]
+	stp	q14, q15, [sp, #480]
+	stp	q16, q17, [sp, #512]
+	stp	q18, q19, [sp, #544]
+	stp	q20, q21, [sp, #576]
+	stp	q22, q23, [sp, #608]
+	stp	q24, q25, [sp, #640]
+	stp	q26, q27, [sp, #672]
+	stp	q28, q29, [sp, #704]
+	stp	q30, q31, [sp, #736]
+	mrs	x1, fpsr
+	mrs	x2, fpcr
+	str	x1, [sp, #768]
+	str	x2, [sp, #776]
 	/*
 	 * PAN on, as a real exception entry would set it (copyio runs with PAN off; vm_fault may block, and XNU panics on
 	 * a context switch with PAN off). The eret below restores the faulting context's PSTATE, PAN included.
@@ -204,6 +272,26 @@ xnu_fault_tramp:
 	msr	elr_el1, x0
 	ldr	x1, [sp, #248]
 	msr	spsr_el1, x1
+	ldr	x1, [sp, #768]
+	ldr	x2, [sp, #776]
+	msr	fpsr, x1
+	msr	fpcr, x2
+	ldp	q0, q1, [sp, #256]
+	ldp	q2, q3, [sp, #288]
+	ldp	q4, q5, [sp, #320]
+	ldp	q6, q7, [sp, #352]
+	ldp	q8, q9, [sp, #384]
+	ldp	q10, q11, [sp, #416]
+	ldp	q12, q13, [sp, #448]
+	ldp	q14, q15, [sp, #480]
+	ldp	q16, q17, [sp, #512]
+	ldp	q18, q19, [sp, #544]
+	ldp	q20, q21, [sp, #576]
+	ldp	q22, q23, [sp, #608]
+	ldp	q24, q25, [sp, #640]
+	ldp	q26, q27, [sp, #672]
+	ldp	q28, q29, [sp, #704]
+	ldp	q30, q31, [sp, #736]
 	ldp	x0, x1, [sp, #0]
 	ldp	x2, x3, [sp, #16]
 	ldp	x4, x5, [sp, #32]
@@ -220,6 +308,6 @@ xnu_fault_tramp:
 	ldp	x26, x27, [sp, #208]
 	ldp	x28, x29, [sp, #224]
 	ldr	x30, [sp, #240]
-	add	sp, sp, #256
+	add	sp, sp, #800
 	eret
 	.size	xnu_fault_tramp, . - xnu_fault_tramp

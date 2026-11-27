@@ -283,7 +283,8 @@ unsigned long xnu_fault_deferred(unsigned long *frame)
 	 * The same address faulting again is normal (libmalloc's MADV_FREE_REUSABLE clears a page's referenced and
 	 * modified state, so each reuse takes one fault). Only report it, rarely, when it looks endless.
 	 */
-	long kr = xnu_kfault(far, esr);
+	unsigned long kr_raw = xnu_kfault(far, esr);
+	int kr = (int)kr_raw;
 	if (this_slot() != s0) {
 		/*
 		 * vm_fault blocked and the thread came back on another CPU. xnu_fault_tramp's eret restores every register
@@ -331,10 +332,11 @@ static int xnu_fault(unsigned long far, unsigned long esr, void *regs)
 	if (!in_xnu)
 		return 1;
 	unsigned long fpc = fki_regs_pc(regs);
-	if (far && ((far >= XNU_VA_LO && far < XNU_VA_HI) || far < 0x0001000000000000ULL) && xnu_kfault &&
+	unsigned long ufar = (far && !(far & (1ULL << 55))) ? (far & 0x00ffffffffffffffULL) : far;
+	if (ufar && ((ufar >= XNU_VA_LO && ufar < XNU_VA_HI) || ufar < 0x0001000000000000ULL) && xnu_kfault &&
 	    fpc >= XNU_VA_LO && fpc < XNU_VA_HI) {
 		kfaults++;
-		xnu_deferred.far = far;
+		xnu_deferred.far = ufar;
 		xnu_deferred.esr = esr;
 		xnu_deferred.pc = fpc;
 		xnu_deferred.pstate = fki_regs_pstate(regs);
@@ -362,7 +364,7 @@ static int xnu_fault(unsigned long far, unsigned long esr, void *regs)
 		return 0;
 	}
 	if (xnu_kfault_recover) {
-		unsigned long rpc = xnu_kfault_recover(pc, far, esr);
+		unsigned long rpc = xnu_kfault_recover(pc, ufar, esr);
 		if (rpc) {
 			fki_regs_set_reg(regs, 0, 14);	/* EFAULT */
 			fki_regs_set_pc(regs, rpc);
@@ -464,11 +466,12 @@ long xnu_hook(unsigned long call, unsigned long a1, unsigned long a2)
 		logs("xnu: run stopped by the host (stop_run)");
 		return 1;
 	}
-	u64_t t0 = fki_counter();
+	u64_t t0 = unlikely(perf) ? fki_counter() : 0;
 	in_call_slot[in_s] = 1;
 	long r = xnu_hook_body(call, a1, a2);
 	in_call_slot[in_s] = 0;
-	acct_add(call, fki_counter() - t0);
+	if (unlikely(perf))
+		acct_add(call, fki_counter() - t0);
 	if (!r) in_xnu = 1;
 	return r;
 }
@@ -524,6 +527,22 @@ static long xnu_hook_body(unsigned long call, unsigned long a1, unsigned long a2
 		if (q && q->result > 0) acct_disk_slot[this_slot()] += (unsigned long)q->result;
 		return 0;
 	}
+	if (call == LINUX64_CALL_DISK_RW_PHYS) {	/* zero-copy block disk I/O at guest physical addr */
+		struct linux64_rw_req *q = (struct linux64_rw_req *)a1;
+		if (!q) return 0;
+		if (!dk_file) { q->result = -6; return 0; }
+		u64_t pa = (u64_t)(uintptr_t)q->buf;
+		u64_t len = q->len;
+		u64_t base_pa = (mode == 3) ? img.region.pa : XNU_FAKE_PHYS;
+		if (pa < base_pa || len > img.region.size || pa - base_pa > img.region.size - len) {
+			q->result = -22;
+			return 0;
+		}
+		void *kva = (char *)img.region.va + (pa - base_pa);
+		q->result = fki_file_rw_direct(dk_file, (int)q->write, kva, (unsigned long)len, q->off);
+		if (q->result > 0) acct_disk_slot[this_slot()] += (unsigned long)q->result;
+		return 0;
+	}
 	if (call == LINUX64_CALL_KEYSTORE_RW) {		/* the keystore file: q->result = bytes moved or -errno */
 		struct linux64_rw_req *q = (struct linux64_rw_req *)a1;
 		if (!q) return 0;
@@ -543,13 +562,16 @@ static long xnu_hook_body(unsigned long call, unsigned long a1, unsigned long a2
 		return 0;
 	}
 	if (call == LINUX64_CALL_CONSOLE_WRITE) {		/* XNU console bytes (/dev/console): line-buffered into the host log */
+		static atomic_t con_lock = ATOMIC_INIT(0);
 		static char line[1000]; static unsigned n;
 		const char *b = (const char *)a1; unsigned long i;
+		while (atomic_cmpxchg_acquire(&con_lock, 0, 1))
+			cpu_relax();
 		for (i = 0; b && i < a2; i++) {
 			char c = b[i];
 			if (c == '\r') continue;
-			if (c != '\n') line[n++] = c;
-			if (c == '\n' || n == sizeof(line) - 1) {
+			if (c != '\n' && n < sizeof(line) - 1) line[n++] = c;
+			if (c == '\n' || n >= sizeof(line) - 1) {
 				static char m[1024]; unsigned j = 0, k;
 				const char *p = "darwin console: ";
 				while (*p) m[j++] = *p++;
@@ -570,6 +592,7 @@ static long xnu_hook_body(unsigned long call, unsigned long a1, unsigned long a2
 			m[j] = 0; n = 0;
 			logs(m);
 		}
+		atomic_set_release(&con_lock, 0);
 		return 0;
 	}
 	if (call == LINUX64_CALL_KPRINTF) {		/* XNU kprintf */

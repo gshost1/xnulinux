@@ -191,8 +191,9 @@ static __always_inline void keys_write(const struct fki_pac_keys *k)
  * here before would come back with the foreign kernel's register contents (random user-space crashes on the hosted
  * kernel's CPU). Before the foreign kernel runs (on entry, and each time it resumes after Linux ran), save the current
  * task's state and make Linux forget whose state the registers hold: an empty kernel-mode NEON section does both.
- * Nothing of the foreign kernel's needs keeping across that: its kernel code does not keep FP/SIMD values across calls
- * into the host, and it saves its user threads' registers on each exception.
+ * The foreign kernel's world switch (world.S) preserves XNU kernel's FP/SIMD registers across calls into the host
+ * (callee-saved d8..d15 + FPCR across upcalls; q0..q31 + FPSR + FPCR across deferred kernel faults), while XNU saves
+ * its user threads' registers on each EL0 exception.
  */
 static void fki_fpsimd_forget(void)
 {
@@ -665,12 +666,14 @@ struct fki_runs {
 };
 
 /* fn runs with interrupts on and turns them off again; then, before the foreign kernel resumes, fki_fpsimd_forget */
+static void fki_net_drain_freeq(void);
 static void fki_runs_then_forget(void *p)
 {
 	struct fki_runs *r = p;
 
 	r->fn(r->arg);
 	local_irq_enable();
+	fki_net_drain_freeq();
 	fki_fpsimd_forget();
 	local_irq_disable();
 }
@@ -828,6 +831,15 @@ EXPORT_SYMBOL(fki_realtime);
 #define FKI_NET_QLEN 1024
 static struct net_device *fki_netdev;
 static struct sk_buff_head fki_net_rxq;	/* Linux -> foreign */
+static struct sk_buff_head fki_net_freeq;	/* drained with IRQs enabled in fki_runs / TX / exit */
+
+static void fki_net_drain_freeq(void)
+{
+	struct sk_buff *skb;
+
+	while ((skb = skb_dequeue(&fki_net_freeq)) != NULL)
+		dev_consume_skb_any(skb);
+}
 
 static netdev_tx_t fki_net_xmit(struct sk_buff *skb, struct net_device *dev)
 {
@@ -880,6 +892,7 @@ static void fki_net_send_body(void *p)
 	fki_netdev->stats.rx_packets++;
 	fki_netdev->stats.rx_bytes += io->len;
 	local_irq_enable();	/* netif_rx re-enables bottom halves, which must not happen with interrupts off */
+	fki_net_drain_freeq();
 	netif_rx(skb);
 	local_irq_disable();
 	io->result = io->len;
@@ -895,31 +908,25 @@ long fki_net_send(const void *frame, unsigned long len)
 }
 EXPORT_SYMBOL(fki_net_send);
 
-static void fki_net_recv_body(void *p)
-{
-	struct fki_net_io *io = p;
-	struct sk_buff *skb = skb_dequeue(&fki_net_rxq);
-
-	io->result = 0;
-	if (!skb)
-		return;
-	if (skb->len > io->len) {
-		io->result = -EMSGSIZE;
-	} else if (skb_copy_bits(skb, 0, io->out, skb->len) == 0) {
-		io->result = skb->len;
-	} else {
-		io->result = -EIO;
-	}
-	dev_consume_skb_any(skb);
-}
-
 /* The next frame Linux sent on xnu0 into buf (at most len bytes): its length, 0 when none is waiting. */
 long fki_net_recv(void *buf, unsigned long len)
 {
-	struct fki_net_io io = { .out = buf, .len = len };
+	struct sk_buff *skb;
+	long ret;
 
-	fki_linux_runs(fki_net_recv_body, &io);
-	return io.result;
+	if (skb_queue_empty(&fki_net_rxq))
+		return 0;
+	skb = skb_dequeue(&fki_net_rxq);
+	if (!skb)
+		return 0;
+	if (skb->len > len)
+		ret = -EMSGSIZE;
+	else if (skb_copy_bits(skb, 0, buf, skb->len) == 0)
+		ret = skb->len;
+	else
+		ret = -EIO;
+	skb_queue_tail(&fki_net_freeq, skb);
+	return ret;
 }
 EXPORT_SYMBOL(fki_net_recv);
 
@@ -957,6 +964,7 @@ static int __init fki_init(void)
 		INIT_CSD(per_cpu_ptr(&fki_kick_csd, cpu), fki_kick_fn, NULL);
 	}
 	skb_queue_head_init(&fki_net_rxq);
+	skb_queue_head_init(&fki_net_freeq);
 	fki_reserve();
 	err = fki_hostcall_init();
 	if (err)
@@ -969,6 +977,8 @@ static int __init fki_init(void)
 	eth_hw_addr_random(dev);
 	dev->min_mtu = 68;
 	dev->max_mtu = ETH_DATA_LEN;
+	dev->features |= NETIF_F_SG;
+	dev->hw_features |= NETIF_F_SG;
 	err = register_netdev(dev);
 	if (err) {
 		free_netdev(dev);
@@ -990,6 +1000,7 @@ static void __exit fki_exit(void)
 		fki_netdev = NULL;
 	}
 	skb_queue_purge(&fki_net_rxq);
+	skb_queue_purge(&fki_net_freeq);
 	fki_free_alt_stacks();
 }
 module_init(fki_init);
@@ -1075,6 +1086,49 @@ static long fki_file_rw_body(void *file, int write, void *buf, unsigned long len
 	return ret < 0 && !done ? ret : (long)done;
 }
 
+
+static long fki_file_rw_direct_body(void *file, int write, void *kva, unsigned long len, fki_u64 off)
+{
+	struct file *f = file;
+	unsigned long done = 0;
+	long ret = 0;
+
+	local_irq_enable();
+	preempt_enable();
+	while (done < len) {
+		unsigned long n = min(len - done, FKI_FILE_CHUNK);
+		loff_t pos = off + done;
+		ssize_t r = write ? kernel_write(f, (char *)kva + done, n, &pos)
+		                  : kernel_read(f, (char *)kva + done, n, &pos);
+		if (r < 0) {
+			ret = r;
+			break;
+		}
+		done += r;
+		if ((unsigned long)r < n)
+			break;
+	}
+	preempt_disable();
+	local_irq_disable();
+	return ret < 0 && !done ? ret : (long)done;
+}
+
+static void fki_file_rw_direct_thunk(void *p)
+{
+	struct fki_file_args *a = p;
+	a->ret = fki_file_rw_direct_body(a->file, a->write, a->buf, a->len, a->off);
+}
+
+long fki_file_rw_direct(void *file, int write, void *kva, unsigned long len, fki_u64 off)
+{
+	struct fki_file_args a = { file, write, kva, len, off, -EIO };
+
+	if (!file)
+		return -EBADF;
+	fki_linux_runs(fki_file_rw_direct_thunk, &a);
+	return a.ret;
+}
+EXPORT_SYMBOL(fki_file_rw_direct);
 
 long fki_file_pwrite(void *file, const void *buf, unsigned long len, fki_u64 off)
 {

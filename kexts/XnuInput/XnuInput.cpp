@@ -13,6 +13,7 @@
 #include <kern/thread.h>
 
 extern "C" long linux64_input_read(void *buffer, unsigned long size);
+extern "C" boolean_t PE_parse_boot_argn(const char *arg_string, void *arg_ptr, int max_arg);
 
 namespace {
 
@@ -144,6 +145,11 @@ XnuHIDDevice *XnuInput::makeDevice(Kind kind)
 
 bool XnuInput::start(IOService *provider)
 {
+  int headless = 0;
+  if (PE_parse_boot_argn("xnu-headless", &headless, sizeof(headless)) && headless) {
+    IOLog("XnuInput: disabled (xnu-headless=1)\n");
+    return false;
+  }
   if (!IOService::start(provider))
     return false;
   for (unsigned usage = 0; usage < 256; usage++)

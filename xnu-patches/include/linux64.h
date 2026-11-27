@@ -60,7 +60,6 @@ linux64_call2(enum linux64_call call, unsigned long a1, unsigned long a2)
 	register unsigned long x0 __asm__("x0") = (unsigned long)call;
 	register unsigned long x1 __asm__("x1") = a1;
 	register unsigned long x2 __asm__("x2") = a2;
-	linux64_dbg[LINUX64_CTR_LAST_CALL] = (unsigned long)call;
 	if (linux64_hook) {
 		/* a plain blr: the hook is host code, not an XNU function pointer (no pointer authentication) */
 		__asm__ volatile ("blr %3"

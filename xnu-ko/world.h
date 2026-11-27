@@ -14,8 +14,12 @@ struct xnu_world {
 	unsigned long long xnu_ttbr0, xnu_tcr;		/* 432, 440: XNU's (its user pmaps, its T0SZ) */
 	unsigned long long xnu_tpidr, xnu_tpidrro;	/* 448, 456: XNU's user TLS registers across an upcall */
 	unsigned long long linux_scs;		/* 464: x18, the shadow call stack of the Linux task that entered */
+	unsigned long long xnu_d[8];		/* 472: XNU callee-saved d8..d15 (AAPCS-64) across upcalls */
+	unsigned long long xnu_fpcr;		/* 536: XNU FPCR across upcalls */
 };
 _Static_assert(__builtin_offsetof(struct xnu_world, linux_scs) == 464, "xnu_world layout");
+_Static_assert(__builtin_offsetof(struct xnu_world, xnu_d) == 472, "xnu_world layout");
+_Static_assert(__builtin_offsetof(struct xnu_world, xnu_fpcr) == 536, "xnu_world layout");
 _Static_assert(__builtin_offsetof(struct xnu_world, xnu_tpidrro) == 456, "xnu_world layout");
 _Static_assert(__builtin_offsetof(struct xnu_world, linux_ttbr0) == 416, "xnu_world layout");
 _Static_assert(sizeof(struct fki_pac_keys) == 88, "fki_pac_keys layout");

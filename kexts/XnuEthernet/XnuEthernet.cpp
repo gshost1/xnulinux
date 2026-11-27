@@ -39,7 +39,7 @@ class XnuEthernet : public IOEthernetController {
     volatile bool fEnabled = false, fActive = false;
     UInt64 fRxPackets = 0, fTxPackets = 0, fRxDrops = 0, fTxDrops = 0;
 
-    void pollReceive();
+    bool pollReceive();
     static void pollThread(void *self, wait_result_t);
 
 public:
@@ -154,12 +154,16 @@ UInt32 XnuEthernet::outputPacket(mbuf_t packet, void *param)
 
 // Takes every frame the host has queued and hands it to the interface. One thread only, so the interface's inputPacket calls are
 // serialized as the family requires. The host's xnu0 delivers only what Linux routes to this guest: no filter here.
-void XnuEthernet::pollReceive()
+bool XnuEthernet::pollReceive()
 {
     for (unsigned n = 0; n < 256; n++) {
         long length = linux64_net_recv(fRx, sizeof(fRx));
-        if (length < ETHER_HDR_LEN)
-            return;
+        if (length == 0)
+            return false;
+        if (length < ETHER_HDR_LEN) {
+            ++fRxDrops;
+            continue;
+        }
         mbuf_t packet = nullptr;
         int copied = -1;
         if (fEnabled && fInterface && length <= frameBytes && (packet = allocatePacket(static_cast<UInt32>(length))) &&
@@ -174,14 +178,19 @@ void XnuEthernet::pollReceive()
         }
         fActive = true;
     }
+    return true;
 }
 
-// 1 ms polls for a second after traffic, 10 ms otherwise (as DroidVMEthernet).
+// 1 ms polls for a second after traffic, 10 ms otherwise (as DroidVMEthernet); drain immediately after a full batch.
 void XnuEthernet::pollThread(void *self, wait_result_t)
 {
     XnuEthernet *ethernet = static_cast<XnuEthernet *>(self);
     for (unsigned quiet = fastPollTicks;;) {
-        ethernet->pollReceive();
+        if (ethernet->pollReceive()) {
+            ethernet->fActive = false;
+            quiet = 0;
+            continue;
+        }
         if (ethernet->fActive) {
             ethernet->fActive = false;
             quiet = 0;

@@ -228,7 +228,7 @@ new file mode 100644
 index 0000000..00cb495
 --- /dev/null
 +++ b/bsd/kern/linux64_host.c
-@@ -0,0 +1,124 @@
+@@ -0,0 +1,131 @@
 +/*
 + * Copyright (c) 2026 xnulinux contributors. All rights reserved.
 + *
@@ -280,7 +280,7 @@ index 0000000..00cb495
 +		return 0;
 +	}
 +	linux64_call(LINUX64_CALL_NET_RECV, &q);
-+	return q.result > 0 ? q.result : 0;
++	return q.result;
 +}
 +
 +/* Whole struct linux64_input_event records into buffer: their bytes, 0 when none wait. */
@@ -335,6 +335,13 @@ index 0000000..00cb495
 +linux64_disk_rw(int write, void *buffer, unsigned long length, unsigned long offset)
 +{
 +	return linux64_rw(LINUX64_CALL_DISK_RW, write, buffer, length, offset);
++}
++
++long linux64_disk_rw_phys(int write, uint64_t phys, unsigned long length, unsigned long offset);
++long
++linux64_disk_rw_phys(int write, uint64_t phys, unsigned long length, unsigned long offset)
++{
++	return linux64_rw(LINUX64_CALL_DISK_RW_PHYS, write, (void *)(uintptr_t)phys, length, offset);
 +}
 +
 +/*

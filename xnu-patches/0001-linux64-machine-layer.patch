@@ -329,7 +329,7 @@ index b65f76c..eac911b 100644
 +				uint64_t now = mach_absolute_time();
 +				cpu_data_t *cdp = thread->machine.CpuDatap;
 +				if (cdp->cpu_int_state == NULL) {
-+					if (now - linux64_last_kyield[slot] > 48000) {
++					if (now - linux64_last_kyield[slot] > 192000) {
 +						extern void rtclock_intr(unsigned int);
 +						linux64_last_kyield[slot] = now;
 +						/*
@@ -856,7 +856,7 @@ index a191eb3..035b1a8 100644
  	LOAD_KERN_STACK_TOP	dst=x1, src=x0, tmp=x2	// Get the top of the kernel stack
  	load_general_registers	x1, 2
  	set_process_dependent_keys_and_sync_context	x0, x1, x2, x3, w4
-@@ -444,3 +442,204 @@ LEXT(machine_set_current_thread)
+@@ -444,3 +442,208 @@ LEXT(machine_set_current_thread)
  
  
  /* vim: set ts=4: */
@@ -889,6 +889,7 @@ index a191eb3..035b1a8 100644
 +	str		x18, [x15, #24]
 +	mrs		x10, SCTLR_EL1
 +	str		x10, [x15, #32]
++	str		x1, [x15, #40]
 +	adrp	x10, EXT(linux64_el0_vectors)@page
 +	add		x10, x10, EXT(linux64_el0_vectors)@pageoff
 +	msr		VBAR_EL1, x10
@@ -972,7 +973,7 @@ index a191eb3..035b1a8 100644
 +	b		Llinux64_el0_irq						// IRQ: the host's interrupt arrived while user code ran
 +	.align 7
 +	.rept 2										// FIQ, SError
-+	b		Llinux64_el0_entry
++	b		Llinux64_el0_irq
 +	.align 7
 +	.endr
 +	.rept 4										// lower EL, AArch32
@@ -1054,9 +1055,12 @@ index a191eb3..035b1a8 100644
 +	ldr		x10, [x9, #16]
 +	msr		VBAR_EL1, x10
 +	ldr		x18, [x9, #24]						// the host's x18 again (user code owns x18 at EL0)
++	ldr		x10, [x9, #40]						// nonzero only when JOP was disabled for arm64
++	cbz		x10, 2f
 +	ldr		x10, [x9, #32]						// SCTLR_EL1 as the kernels expect it (the keys back on)
 +	msr		SCTLR_EL1, x10
 +	isb
++2:
 +	mov		x0, sp
 +	mov		x29, xzr
 +	bl		EXT(linux64_el0_exception)
@@ -1520,7 +1524,7 @@ index d8f1b19..3fac7b4 100644
  #endif
  
  #include <prng/entropy.h>
-@@ -3646,3 +3648,275 @@ sleh_panic_lockdown_should_initiate_el1_sp0_sync(uint64_t esr, uint64_t elr,
+@@ -3646,3 +3648,295 @@ sleh_panic_lockdown_should_initiate_el1_sp0_sync(uint64_t esr, uint64_t elr,
  }
  __SECURITY_STACK_DISALLOWED_POP
  #endif /* CONFIG_SPTM */
@@ -1621,6 +1625,20 @@ index d8f1b19..3fac7b4 100644
 +uint64_t linux64_el0_stat[LINUX64_EL0_CPUS][2][LINUX64_EL0_CLASSES];
 +static uint64_t linux64_el0_t0[LINUX64_EL0_CPUS];
 +static uint8_t linux64_el0_cls[LINUX64_EL0_CPUS];
++static struct { uint64_t exc; uint64_t pad[15]; } linux64_el0_exc_pcpu[LINUX64_EL0_CPUS] __attribute__((aligned(128)));
++static int linux64_el0_perf_level = -1;
++static inline int
++linux64_el0_perf_on(void)
++{
++	if (__improbable(linux64_el0_perf_level < 0)) {
++		int v = 0;
++		if (!PE_parse_boot_argn("linux64_el0_perf", &v, sizeof(v))) {
++			v = 0;
++		}
++		linux64_el0_perf_level = v;
++	}
++	return linux64_el0_perf_level;
++}
 +
 +void
 +linux64_thread_bootstrap_return(void)
@@ -1649,7 +1667,7 @@ index d8f1b19..3fac7b4 100644
 +#if PRECISE_USER_KERNEL_TIME
 +	recount_enter_user();		/* user time vs system time, as locore's return to user space does */
 +#endif
-+	{	/* the host's per-class accounting (linux64_abi.h): the exception this CPU took last is now done */
++	if (__improbable(linux64_el0_perf_on())) {	/* per-class EL0 exception latency accounting when requested */
 +		unsigned int slot = (unsigned int)cpu_number() & (LINUX64_EL0_CPUS - 1);
 +		if (linux64_el0_t0[slot] != 0) {
 +			linux64_el0_stat[slot][1][linux64_el0_cls[slot]] += __builtin_arm_rsr64("CNTVCT_EL0") - linux64_el0_t0[slot];
@@ -1680,17 +1698,23 @@ index d8f1b19..3fac7b4 100644
 +#if PRECISE_USER_KERNEL_TIME
 +	recount_leave_user();		/* interrupts are still off here, as on locore's exception entry */
 +#endif
-+	linux64_count(LINUX64_CTR_EL0_EXC);	/* for the host's monitor: EL0 exceptions, the last one's ESR, FAR, PC */
 +	{
-+		unsigned int slot = (unsigned int)cpu_number() & (LINUX64_EL0_CPUS - 1), ec = (unsigned int)ESR_EC(f->esr);
-+		unsigned int cls = f->esr == ~0ULL ? 3 : ec == ESR_EC_SVC_64 ? 0 : ec == ESR_EC_DABORT_EL0 ? 1 : ec == ESR_EC_IABORT_EL0 ? 2 : 4;
-+		linux64_el0_stat[slot][0][cls]++;
-+		linux64_el0_cls[slot] = (uint8_t)cls;
-+		linux64_el0_t0[slot] = __builtin_arm_rsr64("CNTVCT_EL0");
++		unsigned int slot = (unsigned int)cpu_number() & (LINUX64_EL0_CPUS - 1);
++		uint64_t seq = ++linux64_el0_exc_pcpu[slot].exc;
++		if (__improbable((seq & 255) == 0)) {
++			__atomic_fetch_add(&linux64_dbg[LINUX64_CTR_EL0_EXC], 256, __ATOMIC_RELAXED);
++			linux64_dbg[LINUX64_CTR_EL0_ESR] = f->esr;
++			linux64_dbg[LINUX64_CTR_EL0_FAR] = f->far;
++			linux64_dbg[LINUX64_CTR_EL0_PC] = f->pc;
++		}
++		if (__improbable(linux64_el0_perf_on())) {
++			unsigned int ec = (unsigned int)ESR_EC(f->esr);
++			unsigned int cls = f->esr == ~0ULL ? 3 : ec == ESR_EC_SVC_64 ? 0 : ec == ESR_EC_DABORT_EL0 ? 1 : ec == ESR_EC_IABORT_EL0 ? 2 : 4;
++			linux64_el0_stat[slot][0][cls]++;
++			linux64_el0_cls[slot] = (uint8_t)cls;
++			linux64_el0_t0[slot] = __builtin_arm_rsr64("CNTVCT_EL0");
++		}
 +	}
-+	linux64_dbg[LINUX64_CTR_EL0_ESR] = f->esr;
-+	linux64_dbg[LINUX64_CTR_EL0_FAR] = f->far;
-+	linux64_dbg[LINUX64_CTR_EL0_PC] = f->pc;
 +	if (linux64_tracing()) kprintf("linux64: EL0 exception esr 0x%llx far 0x%llx pc 0x%llx x16 %lld ttbr0 0x%llx ttep 0x%llx\n", f->esr, f->far, f->pc, f->x[16],
 +	    __builtin_arm_rsr64("TTBR0_EL1"), (uint64_t)thread->map->pmap->ttep);
 +	/*

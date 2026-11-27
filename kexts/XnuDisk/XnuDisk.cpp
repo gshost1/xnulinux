@@ -23,6 +23,7 @@
 
 extern "C" uint64_t linux64_disk_size(void);
 extern "C" long linux64_disk_rw(int write, void *buffer, unsigned long length, unsigned long offset);
+extern "C" long linux64_disk_rw_phys(int write, uint64_t phys, unsigned long length, unsigned long offset);
 
 namespace {
 constexpr UInt64 kBlockSize = 512;          // the partition table's LBA size as the host tools wrote it
@@ -155,10 +156,29 @@ IOReturn XnuDisk::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block, UIn
     IOByteCount total = nblks * kBlockSize, done = 0;
     IOReturn status = buffer->prepare();
     if (status == kIOReturnSuccess) {
-        IOLockLock(fLock);
         while (done < total) {
+            IOByteCount segLen = 0;
+            addr64_t segPA = buffer->getPhysicalSegment(done, &segLen);
+            if (segPA && segLen) {
+                IOByteCount piece = segLen < (total - done) ? segLen : (total - done);
+                if (piece > kBounce)
+                    piece = kBounce;
+                long moved = linux64_disk_rw_phys(write, segPA, piece, block * kBlockSize + done);
+                if (moved == (long)piece) {
+                    done += piece;
+                    continue;
+                }
+                if (moved != -22) {
+                    IOLog("XnuDisk: phys %s of %llu bytes at block %llu failed (%ld)\n", write ? "write" : "read",
+                          (UInt64)piece, block + done / kBlockSize, moved);
+                    status = kIOReturnIOError;
+                    break;
+                }
+            }
+            IOLockLock(fLock);
             IOByteCount piece = total - done < kBounce ? total - done : kBounce;
             if (write && buffer->readBytes(done, fBounce, piece) != piece) {
+                IOLockUnlock(fLock);
                 status = kIOReturnIOError;
                 break;
             }
@@ -166,16 +186,18 @@ IOReturn XnuDisk::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block, UIn
             if (moved != (long)piece) {
                 IOLog("XnuDisk: %s of %llu bytes at block %llu failed (%ld)\n", write ? "write" : "read", (UInt64)piece,
                       block + done / kBlockSize, moved);
+                IOLockUnlock(fLock);
                 status = kIOReturnIOError;
                 break;
             }
             if (!write && buffer->writeBytes(done, fBounce, piece) != piece) {
+                IOLockUnlock(fLock);
                 status = kIOReturnIOError;
                 break;
             }
+            IOLockUnlock(fLock);
             done += piece;
         }
-        IOLockUnlock(fLock);
         buffer->complete();
     }
     IOStorage::complete(completion, status, status == kIOReturnSuccess ? total : done);
