@@ -14,6 +14,8 @@ G=/etc/default/grub.d/99-xnulinux.cfg
 # takes effect, which otherwise places the kernel image inside the carve-out on some boots (fki then refuses to map it).
 echo "GRUB_CMDLINE_LINUX=\"\$GRUB_CMDLINE_LINUX mem=$LINUX_MEM nokaslr log_buf_len=128M\"" | sudo tee $G >/dev/null
 sudo update-grub >/dev/null 2>&1
+# the carve-out, for the service (scripts/fki-load.sh) and for xnulinux-boot.sh when fki is not loaded
+echo "CARVE=\"carve_base=$CARVE_BASE carve_mb=$CARVE_MB\"" | sudo tee /etc/xnulinux-fki.conf >/dev/null
 sudo tee /etc/systemd/system/xnulinux-fki.service >/dev/null <<UNIT
 [Unit]
 Description=xnulinux: fki.ko with the hosted kernel's DRAM reserved
@@ -24,7 +26,7 @@ Before=sysinit.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/sbin/insmod $P/fki-ko/fki.ko carve_base=$CARVE_BASE carve_mb=$CARVE_MB
+ExecStart=/bin/bash $P/scripts/fki-load.sh
 
 [Install]
 WantedBy=sysinit.target
@@ -32,4 +34,4 @@ UNIT
 sudo systemctl daemon-reload
 sudo systemctl enable xnulinux-fki.service
 sync
-echo "after a reboot: Linux on $LINUX_MEM, fki.ko loaded with the $CARVE_MB MB carve-out at $CARVE_BASE (rebuild fki-ko before a reboot when it changes)"
+echo "after a reboot: Linux on $LINUX_MEM, fki.ko loaded with the $CARVE_MB MB carve-out at $CARVE_BASE (rebuilt at boot when the kernel changed)"

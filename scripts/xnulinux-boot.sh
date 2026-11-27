@@ -19,7 +19,7 @@
 #   GPU (auto|off)  CPUS (1: the hosted system's CPUs)  XNU_ARGS (more xnu.ko parameters)
 #   ROOT_UUID BOOT_UUID (mac.conf's)  CI_HEADLESS FAST_BOOT FAST_STOP (0|1: no display or input, a shorter first wait, a stop
 #   without the guest's sync: only for a disk that is thrown away)
-#   CARVE (fki's carve-out when fki is not loaded yet: carve_base=0x200000000 carve_mb=8156; 16 KB host carve_base=0x600000000
+#   CARVE (fki's carve-out when fki is not loaded yet; default: /etc/xnulinux-fki.conf, else carve_base=0x200000000 carve_mb=8156; 16 KB host carve_base=0x600000000
 #   carve_mb=8192, a whole number of 32 MiB blocks)
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -99,7 +99,8 @@ sudo dmesg -n "${CONLEVEL:-1}"
 # with the same carve-out
 if [ -e /sys/module/fki/parameters/carve_base ]; then
   CARVE="carve_base=$(cat /sys/module/fki/parameters/carve_base) carve_mb=$(cat /sys/module/fki/parameters/carve_mb)"
-else
+else	# not loaded (no service, or its load failed): the carve-out the VM was set up with, not a guess
+  [ -n "${CARVE:-}" ] || [ ! -r /etc/xnulinux-fki.conf ] || CARVE=$(. /etc/xnulinux-fki.conf; echo "$CARVE")
   CARVE=${CARVE:-$DEF_CARVE}
 fi
 if [ "$(cat /sys/module/fki/srcversion 2>/dev/null)" != "$(modinfo -F srcversion fki-ko/fki.ko)" ]; then
