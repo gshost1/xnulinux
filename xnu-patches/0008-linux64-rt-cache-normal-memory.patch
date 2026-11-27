@@ -1,0 +1,19 @@
+linux64: real-time cache mode on DRAM is normal (write-combined) memory, as on Apple silicon
+CoreAnimation creates its CAMetalLayer drawables with IOSurfaceCacheMode kIOMapRealTimeCache (0x700). XNU maps
+VM_WIMG_RT on DRAM with CACHE_ATTRINDX_RT, which is CACHE_ATTRINDX_WRITECOMB (normal memory) only with HAS_UCNORMAL_MEM
+(Apple silicon) or APPLEVIRTUALPLATFORM; this build (BCM2837) has neither, so RT used slot 7, POSTED_COMBINED_REORDERED.
+Hosted, XNU runs under Linux's MAIR_EL1, whose slot 7 is zero: Device-nGnRnE. An unaligned access to device memory is an
+alignment fault, so the renderer's copies to and from a drawable (memmove) crashed Chess and WindowServer with
+EXC_BAD_ACCESS / EXC_ARM_DA_ALIGN when a window was resized.
+---
+--- a/osfmk/arm64/proc_reg.h
++++ b/osfmk/arm64/proc_reg.h
+@@ -1830,7 +1830,7 @@
+ 
+ #endif /* HAS_FEAT_XS */
+ 
+-#if HAS_UCNORMAL_MEM || APPLEVIRTUALPLATFORM
++#if HAS_UCNORMAL_MEM || APPLEVIRTUALPLATFORM || defined(BCM2837)	/* BCM2837: hosted under Linux's MAIR, slot 7 is device */
+ #define CACHE_ATTRINDX_RT CACHE_ATTRINDX_WRITECOMB
+ #else
+ #define CACHE_ATTRINDX_RT CACHE_ATTRINDX_POSTED_COMBINED_REORDERED
