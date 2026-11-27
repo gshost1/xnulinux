@@ -13,39 +13,10 @@
 	adrp x10, xnu_worlds; add x10, x10, :lo12:xnu_worlds; ldr reg, [x10, reg, lsl #3]
 
 /*
- * The user half (TTBR0, TCR.T0SZ) belongs to whichever world runs: XNU switches TTBR0 to its user pmaps (with its own
- * ASIDs and T0SZ), Linux to the current task's mm. Each switch saves one and loads the other, then drops the local TLB
- * (the two worlds' ASIDs are unrelated). x9 = &xnu_W; clobbers x10.
+ * The address space (TTBR0, TCR, TTBR1 and the user TLS registers) is fki's: fki_enter_mm switches to the foreign one
+ * (XNU's first TTBR0 and TCR from the save area, the guest's private kernel root on its CPUs), fki_leave_mm back, and
+ * every call into Linux that lets Linux run switches to Linux's and back inside fki. Upcalls themselves switch nothing.
  */
-.macro TO_XNU_MM
-	mrs	x10, ttbr0_el1
-	str	x10, [x9, #416]
-	mrs	x10, tcr_el1
-	str	x10, [x9, #424]
-	ldr	x10, [x9, #440]
-	msr	tcr_el1, x10
-	ldr	x10, [x9, #432]
-	msr	ttbr0_el1, x10
-	isb
-	tlbi	vmalle1
-	dsb	nsh
-	isb
-.endm
-.macro TO_LINUX_MM
-	mrs	x10, ttbr0_el1
-	str	x10, [x9, #432]
-	mrs	x10, tcr_el1
-	str	x10, [x9, #440]
-	ldr	x10, [x9, #424]
-	msr	tcr_el1, x10
-	ldr	x10, [x9, #416]
-	msr	ttbr0_el1, x10
-	isb
-	tlbi	vmalle1
-	dsb	nsh
-	isb
-.endm
-
 	.text
 	.globl	xnu_world_call
 	.type	xnu_world_call, %function
@@ -64,15 +35,12 @@ xnu_world_call:
 	mov	x20, x1
 	add	x0, x9, #328		/* load XNU keys */
 	add	x1, x9, #240		/* save Linux keys */
-	bl	fki_enter		/* no preemption, no IRQs */
+	ldr	x2, [x9, #432]		/* XNU's first TTBR0 (fki_empty_ttbr0) */
+	ldr	x3, [x9, #440]		/* XNU's TCR (Linux's, A1 off; 16 KB: T0SZ 17) */
+	bl	fki_enter_mm		/* no preemption, no IRQs, XNU's address space */
 	W(x9)
 	str	x0, [x9, #104]
 	msr	daifset, #0xf		/* XNU's kernel runs with debug exceptions masked (PSTATE.D) */
-	mrs	x10, tpidr_el0		/* XNU writes the user TLS registers of the thread it believes current */
-	str	x10, [x9, #216]
-	mrs	x10, tpidrro_el0
-	str	x10, [x9, #224]
-	TO_XNU_MM
 	/* XNU runs on the Linux task stack: Linux's entry code treats any other stack as overflow. */
 	mov	x0, x20
 	blr	x19
@@ -83,17 +51,12 @@ xnu_world_call:
 xnu_world_abort:			/* from the upcall: Linux keys and TPIDR are live */
 	W(x9)
 	mov	x19, #1
-2:	TO_LINUX_MM
-	ldr	x18, [x9, #464]
-	ldr	x10, [x9, #216]
-	msr	tpidr_el0, x10
-	ldr	x10, [x9, #224]
-	msr	tpidrro_el0, x10
+2:	ldr	x18, [x9, #464]
 	ldr	x10, [x9, #96]
 	mov	sp, x10
 	ldr	x0, [x9, #104]
 	add	x1, x9, #240
-	bl	fki_leave		/* Linux keys, IRQs, preemption back */
+	bl	fki_leave_mm		/* Linux keys, address space, IRQs, preemption back */
 	mov	x0, x19
 	W(x9)
 	ldp	x19, x20, [x9, #0]
@@ -138,53 +101,7 @@ xnu_world_upcall:			/* x0 = stage, called by XNU with blr */
 	stp	d14, d15, [x11, #48]
 	mrs	x10, fpcr
 	str	x10, [x9, #536]
-	/* Non-sleeping IRQ-disabled host calls never touch TTBR0 or schedule Linux tasks: skip TLBI mm switches. */
-	cmp	w0, #841		/* LINUX64_CALL_IPI */
-	b.eq	L_fast_upcall
-	cmp	w0, #817		/* LINUX64_CALL_NET_RECV (no fki_linux_runs) */
-	b.eq	L_fast_upcall
-	cmp	w0, #812		/* LINUX64_CALL_WALLCLOCK */
-	b.eq	L_fast_upcall
-	cmp	w0, #822		/* LINUX64_CALL_RANDOM */
-	b.eq	L_fast_upcall
-	cmp	w0, #821		/* LINUX64_CALL_DISK_SIZE */
-	b.eq	L_fast_upcall
-	cmp	w0, #995		/* LINUX64_CALL_RAMDISK_SIZE */
-	b.eq	L_fast_upcall
-	cmp	w0, #996		/* LINUX64_CALL_CONSOLE_WRITE */
-	b.eq	L_fast_upcall
-	cmp	w0, #998		/* LINUX64_CALL_KPRINTF */
-	b.eq	L_fast_upcall
-	cmp	w0, #840		/* LINUX64_CALL_CPU_START */
-	b.eq	L_fast_upcall
-	/*
-	 * The current XNU thread's user TLS registers: Linux may schedule during the upcall (idle, file I/O), and its
-	 * context switch rewrites TPIDR_EL0 and zeroes TPIDRRO_EL0 (where Darwin user code keeps its TSD pointer).
-	 */
-	mrs	x10, tpidr_el0
-	str	x10, [x9, #448]
-	mrs	x10, tpidrro_el0
-	str	x10, [x9, #456]
-	TO_LINUX_MM
-	add	x0, x9, #240		/* load Linux keys */
-	add	x1, x9, #328		/* save XNU keys */
-	bl	fki_pac_swap
-	mov	x0, x19
-	mov	x1, x20
-	mov	x2, x21
-	bl	xnu_hook
-	cbnz	x0, xnu_world_abort
-	W(x9)
-	ldr	x10, [x9, #448]
-	msr	tpidr_el0, x10
-	ldr	x10, [x9, #456]
-	msr	tpidrro_el0, x10
-	TO_XNU_MM
-	add	x0, x9, #328		/* load XNU keys */
-	add	x1, x9, #240		/* save Linux keys */
-	bl	fki_pac_swap
-	b	L_upcall_out
-L_fast_upcall:
+	/* every upcall runs in XNU's address space; fki switches to Linux's inside the calls that let Linux run */
 	add	x0, x9, #240		/* load Linux keys */
 	add	x1, x9, #328		/* save XNU keys */
 	bl	fki_pac_swap

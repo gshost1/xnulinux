@@ -109,7 +109,9 @@ for attempt in 1 2; do
       failed=1
       break
     fi
-    gip=$(awk '{print $3; exit}' /var/lib/misc/dnsmasq.leases 2>/dev/null || true)
+    # vm-net-up.sh keeps xnu0's leases in /run/dnsmasq-xnu0.leases (the guest's MAC: 02:58:4e:55:00:01)
+    gip=$(awk '$2 == "02:58:4e:55:00:01" {ip = $3} END {if (ip) print ip}' /run/dnsmasq-xnu0.leases 2>/dev/null || true)
+    [ -n "$gip" ] || gip=$(awk '{print $3; exit}' /var/lib/misc/dnsmasq.leases 2>/dev/null || true)
     if [ -n "$gip" ] && ssh -i "$GUEST_SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
         -o LogLevel=ERROR -o ConnectTimeout=3 "${GUEST_USER}@${gip}" true 2>/dev/null; then
       GUEST_IP="$gip"

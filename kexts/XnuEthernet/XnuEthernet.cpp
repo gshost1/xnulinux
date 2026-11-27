@@ -22,6 +22,8 @@
 // bsd/kern/linux64_host.c (the xnulinux kernel patch): one frame to the host, the next frame from it (bytes, 0 when none waits).
 extern "C" long linux64_net_send(const void *frame, unsigned long length);
 extern "C" long linux64_net_recv(void *buffer, unsigned long size);
+// pexpert: a boot argument's value (xnu.ko appends xnu-mac-id=<n>, the guest's number on a host running several)
+extern "C" boolean_t PE_parse_boot_argn(const char *arg_string, void *arg_ptr, int max_arg);
 
 namespace {
 constexpr unsigned frameBytes = 1514;       // a full ethernet frame without the FCS
@@ -62,6 +64,15 @@ OSDefineMetaClassAndStructors(XnuEthernet, IOEthernetController)
 
 bool XnuEthernet::start(IOService *provider)
 {
+    // the MAC before the family's start publishes it: 02:58:4e:55:00:(01 + xnu-mac-id), one per guest on a shared host (each
+    // guest's DHCP lease and the host's view of it follow the MAC)
+    uint32_t macId = 0;
+    if (PE_parse_boot_argn("xnu-mac-id", &macId, sizeof(macId))) {
+        if (macId <= 253)
+            fAddress.bytes[5] = static_cast<uint8_t>(0x01 + macId);
+        else
+            IOLog("XnuEthernet: xnu-mac-id=%u out of range (0..253), keeping the default MAC\n", macId);
+    }
     if (!IOEthernetController::start(provider))
         return false;
     fTxLock = IOLockAlloc();
@@ -91,7 +102,7 @@ bool XnuEthernet::start(IOService *provider)
     if (kernel_thread_start(pollThread, this, &thread) == KERN_SUCCESS)
         thread_deallocate(thread);
     const uint8_t *m = fAddress.bytes;
-    IOLog("XnuEthernet: en0 through the host's xnu0, MAC %02x:%02x:%02x:%02x:%02x:%02x\n", m[0], m[1], m[2], m[3], m[4], m[5]);
+    IOLog("XnuEthernet: en0 through the host's link, MAC %02x:%02x:%02x:%02x:%02x:%02x\n", m[0], m[1], m[2], m[3], m[4], m[5]);
     return true;
 }
 
