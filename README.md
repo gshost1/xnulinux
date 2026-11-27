@@ -20,7 +20,8 @@ run the hosted macOS on a rented cloud ARM VM (Google Cloud C4A, Arm Neoverse V2
   descriptor set ([upstream PR #17](https://github.com/AFK-surf/xnulinux/pull/17)); and the build scripts work on a
   fresh Ubuntu 26.04 host. The `bluetoothd` restart loop is reported as
   [upstream issue #16](https://github.com/AFK-surf/xnulinux/issues/16) and worked around with a boot argument.
-- **Helper tools:** [`tools/cloud/`](tools/cloud/README.md) (ssh, screenshots, input, disk build, image transfer), and
+- **Headless CI fleet, 16 KB kernel & multi-guest packing:** [`docs/ci-v3.md`](docs/ci-v3.md) — ephemeral `dm-snapshot` CoW GitHub Actions supervisor ([`scripts/xnu-runnerd`](scripts/xnu-runnerd)), zero-Mac headless Linux disk factory (`build-disk-linux.sh --headless on`), native 16 KB host+XNU granule port with EL0/pmap/timebase fast paths, and multi-guest packing ([`scripts/ci-multiguest-run.sh`](scripts/ci-multiguest-run.sh): `4×3c` sustaining `104 jobs/hr` on a 16-vCPU ARM64 host, and `2.04×` faster live multi-language GitHub Actions runs than `macos-15`).
+- **Helper tools:** [`tools/cloud/`](tools/cloud/README.md) (ssh, screenshots, input, disk build, image transfer, guest headless tools), and
   tests with expected output in [`tests/hosted/`](tests/hosted/README.md) and [`tests/lavapipe/`](tests/lavapipe/README.md).
 - **For AI coding agents:** a runbook, [`docs/cloud-arm-agent.md`](docs/cloud-arm-agent.md), and [`AGENTS.md`](AGENTS.md).
   A prompt to paste:
