@@ -340,7 +340,9 @@ def cmd_stage(args):
         prefs = [(D / 'Library/Preferences/com.apple.universalaccess.plist', {'reduceTransparency': True, 'reduceMotion': True}, '644', '0:0'),
                  (D / 'Library/Preferences/com.apple.Accessibility.plist', {'ReduceMotionEnabled': True}, '644', '0:0'),
                  (home / 'Library/Preferences/com.apple.universalaccess.plist', {'reduceTransparency': True, 'reduceMotion': True}, '600', '501:20'),
-                 (home / 'Library/Preferences/com.apple.Accessibility.plist', {'ReduceMotionEnabled': True}, '600', '501:20')]
+                 (home / 'Library/Preferences/com.apple.Accessibility.plist', {'ReduceMotionEnabled': True}, '600', '501:20'),
+                 # the wheel as on a PC mouse (no natural scrolling): wheel down (xnu-input.py scroll -N) shows what is below
+                 (home / 'Library/Preferences/.GlobalPreferences.plist', {'com.apple.swipescrolldirection': False}, '600', '501:20')]
         if tune:
             root_write(job, plistlib.dumps({'Label': 'xnulinux.tune', 'RunAtLoad': True, 'ProgramArguments': [
                 '/bin/sh', '-c', '/usr/bin/mdutil -a -i off; /usr/bin/pmset -a powernap 0']}))

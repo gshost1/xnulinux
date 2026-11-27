@@ -26,7 +26,8 @@
       "IOClass": "IOHIDEventDriver",
       "IOProviderClass": "IOHIDInterface",
       "VendorID": 4617,
-      "IOProbeScore": 3000
+      "IOProbeScore": 3000,
+      "HIDSupportsScrollAcceleration": false
     }
   },
   "vtable": {

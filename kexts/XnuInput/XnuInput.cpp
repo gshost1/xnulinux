@@ -6,6 +6,9 @@
 // {u16 type, u16 code, s32 value} that tools/hosted/xnu-input.py appends to xnu.ko's input_in file, read through the hosted
 // kernel's upcall (linux64_input_read, bsd/kern/linux64_host.c). Keys (EV_KEY codes below 0x100) go to the keyboard; buttons,
 // absolute X/Y (0..32767 across the screen) and the wheel to the tablet; SYN_REPORT ends a frame.
+// The tablet's IOHIDEventDriver publishes HIDSupportsScrollAcceleration = No (XnuInput.json): hidd's scroll accelerator
+// treats a notch more than 150 ms after the last one as near-zero velocity and turns it into 0.002 lines (1 px), so a wheel
+// turned at hand speed scrolled 1-6 px a notch. Without it a notch is one line.
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOService.h>
