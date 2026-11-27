@@ -22,22 +22,41 @@ if [ "${1:-}" = stop ]; then	# end the running hosted system (its disk synced fi
     sudo systemctl stop xnudrmd 2>/dev/null || true
     echo "no hosted system is running"; exit 0
   fi
-  printf 'sync\n' >> "${CONSOLE_IN:-/var/tmp/console-in}"; sleep 3
+  if [ "${FAST_STOP:-0}" != 1 ]; then
+    printf 'sync\n' >> "${CONSOLE_IN:-/var/tmp/console-in}"; sleep 3
+  fi
   echo 1 | sudo tee /sys/module/xnu/parameters/stop_run >/dev/null
   # every XNU CPU sees the stop at its next host call; one in a long one (disk I/O while the VM shuts down) takes a while
-  for _ in $(seq 1 600); do pgrep -f "insmod xnu-ko/xnu.ko" >/dev/null || break; sleep 0.2; done
+  _poll=0.2; [ "${FAST_STOP:-0}" = 1 ] && _poll=0.05
+  for _ in $(seq 1 600); do pgrep -f "insmod xnu-ko/xnu.ko" >/dev/null || break; sleep "$_poll"; done
   if lsmod | grep -q '^xnu '; then sudo rmmod xnu; fi
   sudo systemctl stop xnudrmd 2>/dev/null || true
   echo "hosted system stopped"
   exit
 fi
 WAIT=0; [ "${1:-}" = --wait ] && WAIT=1
+_save_env=()
+for _v in DISK RAM_MB GPU CPUS BOOTARGS CONSOLE_IN INPUT_IN FB_DUMP KEYSTORE TRUSTCACHE IMAGE XNU_ARGS CI_HEADLESS FAST_BOOT FAST_STOP; do
+  [ "${!_v+x}" = x ] && _save_env+=("$_v=${!_v}")
+done
 [ -f /etc/xnulinux.conf ] && . /etc/xnulinux.conf
 [ -f /var/tmp/mac.conf ] && . /var/tmp/mac.conf
+if [ "${#_save_env[@]}" -gt 0 ]; then
+  for _kv in "${_save_env[@]}"; do
+    printf -v "${_kv%%=*}" "%s" "${_kv#*=}"
+  done
+fi
+unset _save_env _v _kv
+CI_HEADLESS=${CI_HEADLESS:-0}; FAST_BOOT=${FAST_BOOT:-0}; FAST_STOP=${FAST_STOP:-0}
 DISK=${DISK:-/var/tmp/mac.img}; RAM_MB=${RAM_MB:-7900}; GPU=${GPU:-auto}; CPUS=${CPUS:-1}
 CONSOLE_IN=${CONSOLE_IN:-/var/tmp/console-in}; INPUT_IN=${INPUT_IN:-/var/tmp/xnu-input}; FB_DUMP=${FB_DUMP:-/var/tmp/xnu-fb.raw}
-KEYSTORE=${KEYSTORE:-/var/tmp/xnu-keystore.bin}; TRUSTCACHE=${TRUSTCACHE:-xnu/trustcache-mac.bin}; IMAGE=${IMAGE:-xnu/kc.bin}
+KEYSTORE=${KEYSTORE:-$(dirname "$DISK")/keystore.bin}; TRUSTCACHE=${TRUSTCACHE:-xnu/trustcache-mac.bin}; IMAGE=${IMAGE:-xnu/kc.bin}
 BOOTARGS=${BOOTARGS:-amfi_get_out_of_my_way=1 lp-sip0=2050}
+if [ "$CI_HEADLESS" = 1 ]; then
+  GPU=off
+  XNU_ARGS="fb_width=0 fb_height=0 ${XNU_ARGS:-}"
+  case " $BOOTARGS " in *" xnu-headless=1 "*) ;; *) BOOTARGS="$BOOTARGS xnu-headless=1" ;; esac
+fi
 : "${ROOT_UUID:?no ROOT_UUID (/var/tmp/mac.conf from mk-macvm-disk.sh)}" "${BOOT_UUID:?no BOOT_UUID}"
 lsmod | grep -q '^xnu ' && { echo "xnu.ko is loaded: a hosted system is running (sudo rmmod xnu first)" >&2; exit 1; }
 
@@ -63,8 +82,14 @@ fi
 bash scripts/vm-net-up.sh
 
 # the hosted system's files on the host: console and input queues, the framebuffer xnu.ko writes, the keystore
-: > "$CONSOLE_IN"; : > "$INPUT_IN"; : > "$FB_DUMP"
-rm -f "$KEYSTORE"; truncate -s 1M "$KEYSTORE"	# fresh each boot, as the disk was made (persisting it: production.md)
+IO_ARGS=()
+if [ "$CI_HEADLESS" = 1 ]; then
+  : > "$CONSOLE_IN"
+else
+  : > "$CONSOLE_IN"; : > "$INPUT_IN"; : > "$FB_DUMP"
+  IO_ARGS=(input_in="$INPUT_IN" fb_dump="$FB_DUMP")
+fi
+[ -s "$KEYSTORE" ] || truncate -s 1M "$KEYSTORE"	# kept across boots (was: fresh each boot); the disk holds items sealed under it. Delete the file with a new disk image.
 # XNU's DRAM is one physically contiguous block (GBs, from CMA): free the page cache and compact first. Right after the VM
 # boots the allocation can still fail with the area free (a page in the way not yet migratable): wait and try again,
 # for up to three minutes.
@@ -106,13 +131,13 @@ fi
 # insmod returns when the run ends: it runs detached, its output in /var/tmp/xnu-insmod.log.
 START=$(date +%s)	# the run's log (--wait) starts here, so a failure while xnu.ko loads is in it
 for try in 1 2 3 4 5 6 7 8 9; do
-  sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null; echo 1 | sudo tee /proc/sys/vm/compact_memory >/dev/null
+  [ "$(cat /sys/module/fki/parameters/carve_mb 2>/dev/null || echo 0)" = 0 ] && { sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null; echo 1 | sudo tee /proc/sys/vm/compact_memory >/dev/null; }
   sudo dmesg -C
   sudo setsid nohup insmod xnu-ko/xnu.ko mode=3 cpus="$CPUS" ram_mb="$RAM_MB" image="$IMAGE" \
     trustcache="$TRUSTCACHE" disk="$DISK" root_uuid="$ROOT_UUID" boot_uuid="$BOOT_UUID" preboot_uuid="$BOOT_UUID" \
-    console_in="$CONSOLE_IN" input_in="$INPUT_IN" fb_dump="$FB_DUMP" keystore="$KEYSTORE" bootargs="\"$BOOTARGS\"" ${XNU_ARGS:-} \
+    console_in="$CONSOLE_IN" "${IO_ARGS[@]}" keystore="$KEYSTORE" bootargs="\"$BOOTARGS\"" ${XNU_ARGS:-} \
     > /var/tmp/xnu-insmod.log 2>&1 < /dev/null &
-  sleep 5
+  if [ "$FAST_BOOT" = 1 ]; then sleep 0.5; else sleep 5; fi
   if sudo dmesg | grep -aqE "fki: carve-out .* (overlaps|is not all RAM)"; then	# a configuration error: no retry
     sudo dmesg | grep -aE "fki: carve-out .* (overlaps|is not all RAM)" >&2
     sudo systemctl stop xnudrmd 2>/dev/null || true

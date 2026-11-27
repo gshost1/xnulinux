@@ -71,6 +71,20 @@ siri.vocabularyupdates siri.voiceprofilemanager.xpc siriappintentsd siriinferenc
 siriinferenced.signals siriknowledged siriknowledged.aps siriknowledged.koa.donate siriknowledged.vocabulary.admin
 sirisuggestions sirittsd'''.split()
 TUNE_USER = ['com.apple.' + name for name in TUNE_USER]
+# --headless on: no login window or WindowServer (SSH only) and none of the background churn a CI run does not need
+# (matches patches/guest/xnu-mode so launchctl disable writes the same disabled.plist keys).
+HEADLESS_SYSTEM = [
+    'com.apple.WindowServer', 'com.apple.loginwindow', 'com.apple.logind', 'com.apple.coreservices.uiagent',
+    'com.apple.SoftwareUpdateNotificationManager', 'com.apple.softwareupdated',
+    'com.apple.mobile.softwareupdated', 'com.apple.MobileSoftwareUpdate.CleanupPreparePathService',
+    'com.apple.MobileSoftwareUpdate.CryptegraftService', 'com.apple.mobileassetd',
+    'com.apple.MobileAsset.ManifestStorageService', 'com.apple.dasd', 'com.apple.DASDelegateService',
+    'com.apple.duetexpertd', 'com.apple.apsd', 'com.apple.metadata.mds', 'com.apple.metadata.mds.index',
+    'com.apple.metadata.mds.scan', 'com.apple.metadata.mds.spindump', 'com.apple.XProtect.daemon.scan',
+    'com.apple.XProtect.daemon.scan.startup', 'com.apple.XprotectFramework.PluginService',
+    'com.apple.security.xprotectd', 'com.apple.MRT', 'com.apple.coreduetd', 'com.apple.biomed',
+    'com.apple.triald.system', 'com.apple.siri.acousticsignature', 'com.apple.PowerUIAgent',
+]
 
 
 def fail(message, code=1):
@@ -231,7 +245,9 @@ def cmd_stage(args):
     mk = load_droidvm(args.dvm, args.artifacts, out / 'shim')
     volumes = mk.volumes
     roles, logical = roles_of(mk, image)
-    repo, bundle, user = Path(args.repo).resolve(), Path(args.gpu_bundle).resolve(), args.user
+    repo = Path(args.repo).resolve()
+    bundle = Path(args.gpu_bundle).resolve() if args.gpu_bundle else None
+    user = args.user
     point.mkdir(exist_ok=True)
     source_point.mkdir(exist_ok=True)
     loop = attach(mk, image, logical)
@@ -255,19 +271,20 @@ def cmd_stage(args):
              Path(args.password_file).resolve())
         home = D / 'Users' / user
         lw_path = D / 'Library/Preferences/com.apple.loginwindow.plist'
-        if args.autologin == 'off':
+        if args.autologin == 'off' or args.headless == 'on':
             sudo('rm', '-f', D / 'private/etc/kcpassword')
             lw = plistlib.loads(root_read(lw_path))
             lw.pop('autoLoginUser', None)
             lw.pop('autoLoginUserUID', None)
             root_write(lw_path, plistlib.dumps(lw, fmt=plistlib.FMT_BINARY))
-        # 2. the Metal plugin
+        # 2. the Metal plugin (optional in headless CI mode)
         sudo('mkdir', '-p', D / 'Library/GPUBundles', D / 'Library/LaunchDaemons', D / 'Library/LaunchAgents',
              D / 'private/var/db/com.apple.xpc.launchd', D / 'Library/Preferences', D / 'private/etc')
-        sudo('rm', '-rf', D / 'Library/GPUBundles/XnuCpuMetal.bundle')
-        sudo('cp', '-R', bundle, D / 'Library/GPUBundles/XnuCpuMetal.bundle')
-        sudo('chown', '-R', '0:0', D / 'Library/GPUBundles')
-        sudo('chmod', '-R', 'go-w,a+rX', D / 'Library/GPUBundles')
+        if bundle and bundle.exists():
+            sudo('rm', '-rf', D / 'Library/GPUBundles/XnuCpuMetal.bundle')
+            sudo('cp', '-R', bundle, D / 'Library/GPUBundles/XnuCpuMetal.bundle')
+            sudo('chown', '-R', '0:0', D / 'Library/GPUBundles')
+            sudo('chmod', '-R', 'go-w,a+rX', D / 'Library/GPUBundles')
         # 3. the jobs and settings of scripts/mk-macvm-disk.sh (see there for why each exists)
         shell = {'Label': 'xnulinux.shell', 'ProgramArguments': ['/bin/bash', '-i'], 'RunAtLoad': True,
                  'StandardInPath': '/dev/console', 'StandardOutPath': '/dev/console', 'StandardErrorPath': '/dev/console',
@@ -297,6 +314,11 @@ def cmd_stage(args):
             if tune:
                 disabled[label] = True
             else:
+                disabled.pop(label, None)
+        for label in HEADLESS_SYSTEM:
+            if args.headless == 'on':
+                disabled[label] = True
+            elif label not in DISABLE and (not tune or label not in TUNE_SYSTEM):
                 disabled.pop(label, None)
         disabled['com.openssh.sshd'] = args.ssh != 'on'
         disabled['com.apple.screensharing'] = args.screen_sharing != 'on'
@@ -336,7 +358,37 @@ def cmd_stage(args):
                 root_write(path, plistlib.dumps(value, fmt=plistlib.FMT_BINARY), mode, owner)
             else:
                 sudo('rm', '-f', path)
-        # 6. the ssh key
+        # 6. guest headless/CI tools and optional .app bundles
+        if args.guest_tools_dir:
+            gt = Path(args.guest_tools_dir).resolve()
+            sudo('mkdir', '-p', D / 'usr/local/bin', D / 'private/etc', D / 'private/var/db', D / 'Library/LaunchDaemons')
+            for src_name, dst_rel, mode in (
+                ('xnu-mode', 'usr/local/bin/xnu-mode', '755'),
+                ('xnu-xcrun-seed', 'usr/local/bin/xnu-xcrun-seed', '755'),
+                ('zshenv', 'private/etc/zshenv', '644'),
+                ('org.xnulinux.xcrun-warmup.plist', 'Library/LaunchDaemons/org.xnulinux.xcrun-warmup.plist', '644'),
+            ):
+                src = gt / src_name
+                if src.is_file():
+                    sudo('cp', src, D / dst_rel)
+                    sudo('chown', '0:0', D / dst_rel)
+                    sudo('chmod', mode, D / dst_rel)
+        if args.headless == 'on':
+            sudo('mkdir', '-p', D / 'private/var/db')
+            root_write(D / 'private/var/db/xnu-mode.state', b'MODE=headless\nAUTO_LOGIN_USER=\nAUTO_LOGIN_UID=\n')
+        elif sudo_ok('test', '-f', D / 'private/var/db/xnu-mode.state'):
+            sudo('rm', '-f', D / 'private/var/db/xnu-mode.state')
+        if args.apps_dir:
+            apps_dir = Path(args.apps_dir).resolve()
+            sudo('mkdir', '-p', D / 'Applications')
+            for app in sorted(apps_dir.glob('*.app')):
+                if app.is_dir():
+                    dst = D / 'Applications' / app.name
+                    sudo('rm', '-rf', dst)
+                    sudo('cp', '-a', app, dst)
+                    sudo('chown', '-R', '0:80', dst)
+                    print(f'stage: app {app.name}')
+        # 7. the ssh key
         if args.ssh_key:
             sudo('mkdir', '-p', home / '.ssh')
             sudo('cp', Path(args.ssh_key).resolve(), home / '.ssh/authorized_keys')
@@ -346,10 +398,11 @@ def cmd_stage(args):
         run('sync')
         listing = subprocess.check_output(['sudo', '-n', 'ls', str(D / 'Users'), str(D / 'Library/GPUBundles'),
                                            str(D / 'private/var/db/dslocal/nodes/Default/users')], text=True)
-        if f'{user}.plist' not in listing or 'XnuCpuMetal.bundle' not in listing:
+        if f'{user}.plist' not in listing or (args.headless != 'on' and 'XnuCpuMetal.bundle' not in listing):
             fail('the user record or the GPU bundle is missing on the Data volume after staging')
-        print(f'stage: user {user}, automatic login {args.autologin}, ssh {args.ssh}, screen sharing {args.screen_sharing}, '
-              f'tuning {args.tuning}, {sum(1 for v in disabled.values() if v)} system and '
+        eff_autologin = 'off' if args.headless == 'on' else args.autologin
+        print(f'stage: user {user}, automatic login {eff_autologin}, ssh {args.ssh}, screen sharing {args.screen_sharing}, '
+              f'tuning {args.tuning}, headless {args.headless}, {sum(1 for v in disabled.values() if v)} system and '
               f'{sum(1 for v in user_disabled.values() if v)} user services disabled')
     finally:
         for mount in reversed(mounted):
@@ -419,7 +472,11 @@ def cmd_verify(args):
         'B': ['Cryptexes/App/System/Applications/Safari.app'],
         'D': [f'Users/{args.user}/Library/Preferences/com.apple.SetupAssistant.plist',
               f'private/var/db/dslocal/nodes/Default/users/{args.user}.plist', 'private/var/db/.AppleSetupDone',
-              'Library/GPUBundles/XnuCpuMetal.bundle/Contents/MacOS/XnuCpuMetal', 'Library/LaunchDaemons/xnulinux.shell.plist',
+              *([] if args.headless == 'on' else ['Library/GPUBundles/XnuCpuMetal.bundle/Contents/MacOS/XnuCpuMetal']),
+              'Library/LaunchDaemons/xnulinux.shell.plist',
+              *( ['private/var/db/xnu-mode.state'] if args.headless == 'on' else [] ),
+              *( ['usr/local/bin/xnu-mode', 'usr/local/bin/xnu-xcrun-seed', 'private/etc/zshenv',
+                  'Library/LaunchDaemons/org.xnulinux.xcrun-warmup.plist'] if args.guest_tools_dir else [] ),
               'private/var/db/com.apple.xpc.launchd/disabled.plist'],
     }
     bad = 0
@@ -463,7 +520,9 @@ def main():
         p.add_argument('--user', default='xnu')
         p.add_argument('--ssh-key')
         p.add_argument('--trustcache')
-        for flag in ('--ssh', '--screen-sharing', '--autologin', '--tuning'):
+        p.add_argument('--guest-tools-dir')
+        p.add_argument('--apps-dir')
+        for flag in ('--ssh', '--screen-sharing', '--autologin', '--tuning', '--headless'):
             p.add_argument(flag, choices=['on', 'off'], default='off')
     args = parser.parse_args()
     try:

@@ -20,6 +20,9 @@
 #   --screen-sharing on|off  Screen Sharing in the hosted system [XNU_DISK_SCREEN_SHARING, default off]
 #   --autologin on|off    log the user in at boot; off shows the login window [XNU_DISK_AUTOLOGIN, default on]
 #   --tuning on|off       the settings for CPU rendering of docs/cloud-arm.md section 12 [XNU_DISK_TUNING, default on]
+#   --headless on|off     headless CI mode: disables WindowServer/loginwindow/GUI daemons; --gpu-bundle is optional [XNU_DISK_HEADLESS, default off]
+#   --guest-tools-dir DIR optional dir with xnu-mode, xnu-xcrun-seed, zshenv, org.xnulinux.xcrun-warmup.plist to stage
+#   --apps-dir DIR        optional dir whose *.app bundles are copied into /Applications on the Data volume
 #   --macos NAME          the macOS build, a profile of macOS-DroidVM [XNU_DISK_MACOS, default in build-disk-linux.lock].
 #                         It must be the build your kernel collection was made from. Only 27.2-26B123 was tested.
 #   --repo DIR            this repository on the host [default: the checkout this script is in]
@@ -67,7 +70,7 @@ onoff() { case "$2" in on|off) ;; *) usage_error "$1 takes on or off, not '$2'";
 
 OUT=${XNU_DISK_OUT:-}; WORK=${XNU_DISK_WORK:-}; BUNDLE=${XNU_DISK_GPU_BUNDLE:-}; PWFILE=${XNU_DISK_PASSWORD_FILE:-}
 SIZE=${XNU_DISK_SIZE_GIB:-64}; GUEST_USER=${XNU_DISK_USER:-xnu}; SSH_KEY=${XNU_DISK_SSH_KEY:-}; SSH=${XNU_DISK_SSH:-}
-SCREEN=${XNU_DISK_SCREEN_SHARING:-off}; AUTOLOGIN=${XNU_DISK_AUTOLOGIN:-on}; TUNING=${XNU_DISK_TUNING:-on}
+SCREEN=${XNU_DISK_SCREEN_SHARING:-off}; AUTOLOGIN=${XNU_DISK_AUTOLOGIN:-on}; TUNING=${XNU_DISK_TUNING:-on}; HEADLESS=${XNU_DISK_HEADLESS:-off}; GUEST_TOOLS_DIR=${XNU_DISK_GUEST_TOOLS_DIR:-}; APPS_DIR=${XNU_DISK_APPS_DIR:-}
 MACOS=${XNU_DISK_MACOS:-}; REPO=$(cd "$HERE/../../.." && pwd); INSTALL_DEPS=0; FORCE=" "; RUN=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -83,6 +86,9 @@ while [ $# -gt 0 ]; do
     --screen-sharing) SCREEN=${2:?}; shift 2;;
     --autologin) AUTOLOGIN=${2:?}; shift 2;;
     --tuning) TUNING=${2:?}; shift 2;;
+    --headless) HEADLESS=${2:?}; shift 2;;
+    --guest-tools-dir) GUEST_TOOLS_DIR=${2:?}; shift 2;;
+    --apps-dir) APPS_DIR=${2:?}; shift 2;;
     --macos) MACOS=${2:?}; shift 2;;
     --repo) REPO=${2:?}; shift 2;;
     --install-deps) INSTALL_DEPS=1; shift;;
@@ -93,7 +99,7 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$OUT" ] || usage_error "--out DIR is required"
 [ -n "$SSH" ] || { [ -n "$SSH_KEY" ] && SSH=on || SSH=off; }
-onoff --ssh "$SSH"; onoff --screen-sharing "$SCREEN"; onoff --autologin "$AUTOLOGIN"; onoff --tuning "$TUNING"
+onoff --ssh "$SSH"; onoff --screen-sharing "$SCREEN"; onoff --autologin "$AUTOLOGIN"; onoff --tuning "$TUNING"; onoff --headless "$HEADLESS"
 case "$SIZE" in ''|*[!0-9]*) usage_error "--size-gib takes a whole number";; esac
 { [ "$SIZE" -ge 32 ] && [ "$SIZE" -le 480 ]; } || usage_error "--size-gib must be between 32 and 480"
 case "$GUEST_USER" in ''|*[!a-z0-9_]*|[0-9]*) usage_error "--user must be lower-case letters, digits or _, not starting with a digit";; esac
@@ -130,9 +136,11 @@ check_inputs() {
 image_fingerprint() { echo "size=$SIZE macos=$MACOS"; }
 check_image() { [ -s "$OUT/mac.img" ] && [ "$(cat "$STATE/image.done" 2>/dev/null)" = "$(image_fingerprint)" ] && sgdisk -p "$OUT/mac.img" 2>/dev/null | grep -q iBootSystemContainer; }
 stage_fingerprint() {
-  echo "user=$GUEST_USER autologin=$AUTOLOGIN ssh=$SSH screen=$SCREEN tuning=$TUNING"
+  echo "user=$GUEST_USER autologin=$AUTOLOGIN ssh=$SSH screen=$SCREEN tuning=$TUNING headless=$HEADLESS"
   echo "key=$( [ -n "$SSH_KEY" ] && sha256sum < "$SSH_KEY" | cut -c1-16 )"
-  echo "bundle=$(cd "$BUNDLE" 2>/dev/null && find . -type f -exec sha256sum {} + | sort -k2 | sha256sum | cut -c1-16)"
+  echo "bundle=$( [ -n "$BUNDLE" ] && [ -d "$BUNDLE" ] && cd "$BUNDLE" && find . -type f -exec sha256sum {} + | sort -k2 | sha256sum | cut -c1-16)"
+  echo "guest_tools=$( [ -n "$GUEST_TOOLS_DIR" ] && [ -d "$GUEST_TOOLS_DIR" ] && cd "$GUEST_TOOLS_DIR" && find . -type f -exec sha256sum {} + | sort -k2 | sha256sum | cut -c1-16)"
+  echo "apps=$( [ -n "$APPS_DIR" ] && [ -d "$APPS_DIR" ] && ls -1 "$APPS_DIR" | sort | sha256sum | cut -c1-16)"
   echo "image=$(stat -c %Y "$STATE/image.done" 2>/dev/null)"
 }
 check_stage() { [ "$(cat "$STATE/stage.done" 2>/dev/null)" = "$(stage_fingerprint)" ]; }
@@ -143,12 +151,14 @@ check_finish() {
 
 # --- the stages ----------------------------------------------------------------------------------------------------------
 need_inputs() {	# the three required inputs, checked before anything long runs
-  [ -n "$BUNDLE" ] || usage_error "--gpu-bundle DIR is required"
   [ -n "$PWFILE" ] || usage_error "--password-file FILE is required"
-  [ -f "$BUNDLE/Contents/Info.plist" ] && [ -f "$BUNDLE/Contents/MacOS/XnuCpuMetal" ] ||
-    die "$BUNDLE is not an XnuCpuMetal.bundle (no Contents/MacOS/XnuCpuMetal): give the bundle's own folder" 2
-  ls "$BUNDLE"/Contents/Frameworks/libvulkan_lvp*.dylib >/dev/null 2>&1 ||
-    die "$BUNDLE has no Contents/Frameworks/libvulkan_lvp.dylib: without the CPU renderer the desktop does not start" 2
+  if [ "$HEADLESS" = off ] || [ -n "$BUNDLE" ]; then
+    [ -n "$BUNDLE" ] || usage_error "--gpu-bundle DIR is required unless --headless on"
+    [ -f "$BUNDLE/Contents/Info.plist" ] && [ -f "$BUNDLE/Contents/MacOS/XnuCpuMetal" ] ||
+      die "$BUNDLE is not an XnuCpuMetal.bundle (no Contents/MacOS/XnuCpuMetal): give the bundle's own folder" 2
+    ls "$BUNDLE"/Contents/Frameworks/libvulkan_lvp*.dylib >/dev/null 2>&1 ||
+      die "$BUNDLE has no Contents/Frameworks/libvulkan_lvp.dylib: without the CPU renderer the desktop does not start" 2
+  fi
   sudo -n true 2>/dev/null || die "sudo asks for a password: this script needs sudo without a prompt (see --help for what runs as root)" 3
   sudo -n test -f "$PWFILE" || die "cannot find the password file $PWFILE" 2
   case "$(sudo -n stat -c %a "$PWFILE")" in *00) ;; *) die "$PWFILE can be read by other users: chmod 600 it" 2;; esac
@@ -160,6 +170,13 @@ need_inputs() {	# the three required inputs, checked before anything long runs
   elif [ "$SSH" = on ]; then
     err "note: --ssh on without --ssh-key: logging in over ssh will need the password"
   fi
+  if [ -n "$GUEST_TOOLS_DIR" ]; then
+    [ -d "$GUEST_TOOLS_DIR" ] || die "cannot find --guest-tools-dir $GUEST_TOOLS_DIR" 2
+    for gt in xnu-mode xnu-xcrun-seed zshenv org.xnulinux.xcrun-warmup.plist; do
+      [ -f "$GUEST_TOOLS_DIR/$gt" ] || die "$GUEST_TOOLS_DIR lacks $gt" 2
+    done
+  fi
+  if [ -n "$APPS_DIR" ]; then [ -d "$APPS_DIR" ] || die "cannot find --apps-dir $APPS_DIR" 2; fi
   [ -f "$REPO/tools/hosted/gui-user.py" ] || die "$REPO is not this repository (no tools/hosted/gui-user.py): set --repo" 2
 }
 do_preflight() {
@@ -272,8 +289,8 @@ do_image() {
 do_stage() {
   rm -f "$STATE/stage.done"
   # shellcheck disable=SC2046
-  $PY stage --dvm "$DVM" --artifacts "$ART" --out "$OUT" --repo "$REPO" --gpu-bundle "$BUNDLE" --password-file "$PWFILE" --user "$GUEST_USER" \
-    $( [ -n "$SSH_KEY" ] && printf -- '--ssh-key\n%s\n' "$SSH_KEY" ) --ssh "$SSH" --screen-sharing "$SCREEN" --autologin "$AUTOLOGIN" --tuning "$TUNING" || return 1
+  $PY stage --dvm "$DVM" --artifacts "$ART" --out "$OUT" --repo "$REPO" ${BUNDLE:+--gpu-bundle "$BUNDLE"} --password-file "$PWFILE" --user "$GUEST_USER" \
+    $( [ -n "$SSH_KEY" ] && printf -- '--ssh-key\n%s\n' "$SSH_KEY" ) $( [ -n "$GUEST_TOOLS_DIR" ] && printf -- '--guest-tools-dir\n%s\n' "$GUEST_TOOLS_DIR" ) $( [ -n "$APPS_DIR" ] && printf -- '--apps-dir\n%s\n' "$APPS_DIR" ) --ssh "$SSH" --screen-sharing "$SCREEN" --autologin "$AUTOLOGIN" --tuning "$TUNING" --headless "$HEADLESS" || return 1
   stage_fingerprint > "$STATE/stage.done"
 }
 do_finish() {
@@ -283,7 +300,7 @@ do_finish() {
     python3 "$HERE/apfs-alloc-count.py" --offset "$off" "$OUT/mac.img" > /dev/null || { err "the block counters still disagree after the correction"; return 1; }
   done
   $PY finish --dvm "$DVM" --artifacts "$ART" --out "$OUT" --trustcache "$ART/$(member StaticTrustCache)" || return 1
-  $PY verify --dvm "$DVM" --artifacts "$ART" --out "$OUT" --user "$GUEST_USER" || { err "the finished image lacks files a boot needs (lines marked MISSING above)"; return 1; }
+  $PY verify --dvm "$DVM" --artifacts "$ART" --out "$OUT" --user "$GUEST_USER" --headless "$HEADLESS" ${GUEST_TOOLS_DIR:+--guest-tools-dir "$GUEST_TOOLS_DIR"} || { err "the finished image lacks files a boot needs (lines marked MISSING above)"; return 1; }
   rmdir "$OUT/scratch/volume" "$OUT/scratch/source" "$OUT/scratch" 2>/dev/null; rm -rf "$OUT/shim"
   # the Linux apfs driver is only needed while the disk is built
   if lsmod | grep -q '^apfs ' && ! grep -q ' apfs ' /proc/mounts; then sudo -n rmmod apfs 2>/dev/null || true; fi
