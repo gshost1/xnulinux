@@ -972,10 +972,10 @@ index a191eb3..035b1a8 100644
 +	.align 7
 +	b		Llinux64_el0_irq						// IRQ: the host's interrupt arrived while user code ran
 +	.align 7
-+	.rept 2										// FIQ, SError
-+	b		Llinux64_el0_irq
++	b		Llinux64_el0_irq						// FIQ (masked at EL0 while hosted): as an IRQ
 +	.align 7
-+	.endr
++	b		Llinux64_el0_entry						// SError: with its ESR, so XNU reports it (never resumed as an IRQ)
++	.align 7
 +	.rept 4										// lower EL, AArch32
 +	b		.
 +	.align 7

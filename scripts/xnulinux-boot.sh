@@ -13,9 +13,12 @@
 # Configuration: /etc/xnulinux.conf, then /var/tmp/mac.conf (written by mk-macvm-disk.sh: ROOT_UUID, BOOT_UUID), then the
 # environment:
 #   DISK (/var/tmp/mac.img)  RAM_MB (7900)  BOOTARGS  CONSOLE_IN (/var/tmp/console-in)  INPUT_IN (/var/tmp/xnu-input)
-#   FB_DUMP (/var/tmp/xnu-fb.raw)  KEYSTORE (/var/tmp/xnu-keystore.bin)  TRUSTCACHE (xnu/trustcache-mac.bin)
+#   FB_DUMP (/var/tmp/xnu-fb.raw)  KEYSTORE (keystore.bin beside DISK when DISK is a file, else /var/tmp/xnu-keystore.bin;
+#   kept across boots, for one disk: see below)  TRUSTCACHE (xnu/trustcache-mac.bin)
 #   IMAGE (the kernel collection under /lib/firmware: xnu/kc.bin on a 4 KB-page host, xnu/kc16k.bin on a 16 KB one)
 #   GPU (auto|off)  CPUS (1: the hosted system's CPUs)  XNU_ARGS (more xnu.ko parameters)
+#   ROOT_UUID BOOT_UUID (mac.conf's)  CI_HEADLESS FAST_BOOT FAST_STOP (0|1: no display or input, a shorter first wait, a stop
+#   without the guest's sync: only for a disk that is thrown away)
 #   CARVE (fki's carve-out when fki is not loaded yet: carve_base=0x200000000 carve_mb=8156; 16 KB host carve_base=0x600000000
 #   carve_mb=8192, a whole number of 32 MiB blocks)
 set -euo pipefail
@@ -29,9 +32,10 @@ if [ "${1:-}" = stop ]; then	# end the running hosted system (its disk synced fi
     printf 'sync\n' >> "${CONSOLE_IN:-/var/tmp/console-in}"; sleep 3
   fi
   echo 1 | sudo tee /sys/module/xnu/parameters/stop_run >/dev/null
-  # every XNU CPU sees the stop at its next host call; one in a long one (disk I/O while the VM shuts down) takes a while
-  _poll=0.2; [ "${FAST_STOP:-0}" = 1 ] && _poll=0.05
-  for _ in $(seq 1 600); do pgrep -f "insmod xnu-ko/xnu.ko" >/dev/null || break; sleep "$_poll"; done
+  # every XNU CPU sees the stop at its next host call; one in a long one (disk I/O while the VM shuts down) takes a while:
+  # up to 120 s either way (FAST_STOP looks more often, it does not give up sooner: rmmod fails while insmod runs)
+  _poll=0.2; _n=600; [ "${FAST_STOP:-0}" = 1 ] && { _poll=0.05; _n=2400; }
+  for _ in $(seq 1 "$_n"); do pgrep -f "insmod xnu-ko/xnu.ko" >/dev/null || break; sleep "$_poll"; done
   if lsmod | grep -q '^xnu '; then sudo rmmod xnu; fi
   sudo systemctl stop xnudrmd 2>/dev/null || true
   echo "hosted system stopped"
@@ -39,7 +43,8 @@ if [ "${1:-}" = stop ]; then	# end the running hosted system (its disk synced fi
 fi
 WAIT=0; [ "${1:-}" = --wait ] && WAIT=1
 _save_env=()
-for _v in DISK RAM_MB GPU CPUS BOOTARGS CONSOLE_IN INPUT_IN FB_DUMP KEYSTORE TRUSTCACHE IMAGE XNU_ARGS CI_HEADLESS FAST_BOOT FAST_STOP CARVE; do
+for _v in DISK RAM_MB GPU CPUS BOOTARGS CONSOLE_IN INPUT_IN FB_DUMP KEYSTORE TRUSTCACHE IMAGE XNU_ARGS CI_HEADLESS FAST_BOOT FAST_STOP CARVE \
+    ROOT_UUID BOOT_UUID; do
   [ "${!_v+x}" = x ] && _save_env+=("$_v=${!_v}")
 done
 [ -f /etc/xnulinux.conf ] && . /etc/xnulinux.conf
@@ -57,7 +62,7 @@ CONSOLE_IN=${CONSOLE_IN:-/var/tmp/console-in}; INPUT_IN=${INPUT_IN:-/var/tmp/xnu
 PAGESZ=$(getconf PAGESIZE)
 if [ "$PAGESZ" = 16384 ]; then DEF_IMAGE=xnu/kc16k.bin; DEF_CARVE="carve_base=0x600000000 carve_mb=8192"
 else DEF_IMAGE=xnu/kc.bin; DEF_CARVE="carve_base=0x200000000 carve_mb=8156"; fi
-KEYSTORE=${KEYSTORE:-$(dirname "$DISK")/keystore.bin}; TRUSTCACHE=${TRUSTCACHE:-xnu/trustcache-mac.bin}; IMAGE=${IMAGE:-$DEF_IMAGE}
+KEYSTORE=${KEYSTORE:-$([ -f "$DISK" ] && echo "$(dirname "$DISK")/keystore.bin" || echo /var/tmp/xnu-keystore.bin)}; TRUSTCACHE=${TRUSTCACHE:-xnu/trustcache-mac.bin}; IMAGE=${IMAGE:-$DEF_IMAGE}
 BOOTARGS=${BOOTARGS:-amfi_get_out_of_my_way=1 lp-sip0=2050}
 # The DEVELOPMENT kernel's runtime validations a hosted system does without (a RELEASE kernel has none; the kexts are the
 # same): KF_PMAPV_OVRD 0x4 (duplicate-PV/corruption checks), KF_COMPRSV_OVRD 0x20 (compressor popcount/checksum/c_seg wp),
@@ -72,6 +77,14 @@ if [ "$CI_HEADLESS" = 1 ]; then
 fi
 : "${ROOT_UUID:?no ROOT_UUID (/var/tmp/mac.conf from mk-macvm-disk.sh)}" "${BOOT_UUID:?no BOOT_UUID}"
 lsmod | grep -q '^xnu ' && { echo "xnu.ko is loaded: a hosted system is running (sudo rmmod xnu first)" >&2; exit 1; }
+# The keystore is kept across boots (was: fresh each boot): the disk holds items sealed under it, so it belongs to one disk.
+# The system volume it was last used with is noted beside it; a different one (a new disk image) is refused, not booted
+# with another disk's keystore.
+if [ -s "$KEYSTORE.root" ] && [ "$(cat "$KEYSTORE.root")" != "$ROOT_UUID" ]; then
+  echo "$KEYSTORE belongs to the disk with system volume $(cat "$KEYSTORE.root"), not $ROOT_UUID: give this disk its own" \
+    "KEYSTORE=, or delete $KEYSTORE and $KEYSTORE.root for a new disk image" >&2
+  exit 1
+fi
 
 K=/lib/modules/$(uname -r)/build
 build() {	# a module; its compiler errors on failure
@@ -106,7 +119,9 @@ else
   : > "$CONSOLE_IN"; : > "$INPUT_IN"; : > "$FB_DUMP"
   IO_ARGS=(input_in="$INPUT_IN" fb_dump="$FB_DUMP")
 fi
-[ -s "$KEYSTORE" ] || truncate -s 1M "$KEYSTORE"	# kept across boots (was: fresh each boot); the disk holds items sealed under it. Delete the file with a new disk image.
+# the keystore (kept across boots, for one disk: checked above)
+[ -s "$KEYSTORE" ] || truncate -s 1M "$KEYSTORE"
+printf '%s\n' "$ROOT_UUID" > "$KEYSTORE.root"
 # XNU's DRAM is one physically contiguous block (GBs, from CMA): free the page cache and compact first. Right after the VM
 # boots the allocation can still fail with the area free (a page in the way not yet migratable): wait and try again,
 # for up to three minutes.

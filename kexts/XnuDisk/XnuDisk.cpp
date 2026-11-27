@@ -35,6 +35,7 @@ class XnuDisk : public IOBlockStorageDevice {
     UInt64 fBlocks = 0;
     IOLock *fLock = nullptr;
     uint8_t *fBounce = nullptr;
+    volatile bool fPhysIO = true;               // the host moves bytes at physical addresses (LINUX64_CALL_DISK_RW_PHYS)
     char fVendor[8] = "Apple", fProduct[24] = "xnulinux Disk", fRevision[8] = "1.0", fInfo[4] = "";
 
 public:
@@ -158,7 +159,7 @@ IOReturn XnuDisk::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block, UIn
     if (status == kIOReturnSuccess) {
         while (done < total) {
             IOByteCount segLen = 0;
-            addr64_t segPA = buffer->getPhysicalSegment(done, &segLen);
+            addr64_t segPA = fPhysIO ? buffer->getPhysicalSegment(done, &segLen, kIOMemoryMapperNone) : 0;
             if (segPA && segLen) {
                 IOByteCount piece = segLen < (total - done) ? segLen : (total - done);
                 if (piece > kBounce)
@@ -168,11 +169,11 @@ IOReturn XnuDisk::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block, UIn
                     done += piece;
                     continue;
                 }
-                if (moved != -22) {
-                    IOLog("XnuDisk: phys %s of %llu bytes at block %llu failed (%ld)\n", write ? "write" : "read",
-                          (UInt64)piece, block + done / kBlockSize, moved);
-                    status = kIOReturnIOError;
-                    break;
+                // Anything else goes through the bounce buffer below, which reports a real I/O error. A host without
+                // the call (an older xnu.ko: the request comes back with linux64_rw's -ENXIO) is not asked again.
+                if (moved == -6) {
+                    fPhysIO = false;
+                    IOLog("XnuDisk: the host has no physical-address I/O; using the bounce buffer\n");
                 }
             }
             IOLockLock(fLock);

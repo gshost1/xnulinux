@@ -101,6 +101,16 @@ struct linux64_tb_scale {
 };
 extern struct linux64_tb_scale linux64_tb;
 
+/*
+ * The FP/SIMD registers a call into the host may change. A host call can let Linux run (schedule, take interrupts, use
+ * kernel-mode NEON), which reuses the whole register file; the host's world switch (xnu-ko/world.S) keeps only d8..d15
+ * and FPCR, as for a real function call. An asm statement is not a call: without these clobbers the compiler may keep a
+ * value in any v register across it (a caller-saved one, or the upper half of v8..v15) and find it changed.
+ */
+#define LINUX64_FPSIMD_CLOBBERS \
+	"v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", \
+	"v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31"
+
 /* A call into the host (enum linux64_call). The host's answer: 0 to go on. */
 static inline unsigned long
 linux64_call2(enum linux64_call call, unsigned long a1, unsigned long a2)
@@ -114,7 +124,7 @@ linux64_call2(enum linux64_call call, unsigned long a1, unsigned long a2)
 		    : "+r"(x0), "+r"(x1), "+r"(x2)
 		    : "r"(linux64_hook)
 		    : "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17",
-		    "x30", "cc", "memory");
+		    "x30", "cc", "memory", LINUX64_FPSIMD_CLOBBERS);
 	}
 	return x0;
 }

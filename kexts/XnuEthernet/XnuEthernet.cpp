@@ -28,6 +28,7 @@ extern "C" boolean_t PE_parse_boot_argn(const char *arg_string, void *arg_ptr, i
 namespace {
 constexpr unsigned frameBytes = 1514;       // a full ethernet frame without the FCS
 constexpr unsigned fastPollMs = 1, idlePollMs = 10, fastPollTicks = 1000;   // 1 ms polls for a second after any traffic
+constexpr unsigned maxBursts = 8;           // full batches drained back to back before the thread sleeps anyway
 constexpr UInt64 linkSpeed = 1000 * 1000000ULL;
 }
 
@@ -192,16 +193,19 @@ bool XnuEthernet::pollReceive()
     return true;
 }
 
-// 1 ms polls for a second after traffic, 10 ms otherwise (as DroidVMEthernet); drain immediately after a full batch.
+// 1 ms polls for a second after traffic, 10 ms otherwise (as DroidVMEthernet); drain immediately after a full batch, at most
+// maxBursts times in a row: a receive no longer lets Linux take its interrupts (fki_net_recv runs with them masked), so an
+// endless flood would otherwise hold this CPU, and the Linux CPU under it, for as long as it lasts.
 void XnuEthernet::pollThread(void *self, wait_result_t)
 {
     XnuEthernet *ethernet = static_cast<XnuEthernet *>(self);
-    for (unsigned quiet = fastPollTicks;;) {
-        if (ethernet->pollReceive()) {
+    for (unsigned quiet = fastPollTicks, bursts = 0;;) {
+        if (ethernet->pollReceive() && ++bursts < maxBursts) {
             ethernet->fActive = false;
             quiet = 0;
             continue;
         }
+        bursts = 0;
         if (ethernet->fActive) {
             ethernet->fActive = false;
             quiet = 0;
