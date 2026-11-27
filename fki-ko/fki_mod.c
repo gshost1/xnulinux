@@ -41,6 +41,10 @@
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
 #include <linux/skbuff.h>
+#include <linux/pgtable.h>
+#include <linux/spinlock.h>
+#include <linux/bitmap.h>
+#include <linux/sizes.h>
 
 int fki_version(void)
 {
@@ -78,6 +82,7 @@ static set_memory_fn p_set_memory_x, p_set_memory_nx;
 static unsigned long p_stext, p_end;
 static u64 *p_kimage_voffset;
 static int (*p_efi_mem_type)(unsigned long);	/* the firmware's memory map: is the carve-out RAM at all */
+static struct mm_struct *p_init_mm;	/* the kernel's page tables (init_mm is not exported): the foreign window */
 
 static int fki_resolve(void)
 {
@@ -105,7 +110,8 @@ static int fki_resolve(void)
 	p_end = lookup("_end");
 	p_kimage_voffset = (u64 *)lookup("kimage_voffset");
 	p_efi_mem_type = (void *)lookup("efi_mem_type");
-	return p_set_memory_x && p_set_memory_nx ? 0 : -ENOENT;
+	p_init_mm = (struct mm_struct *)lookup("init_mm");
+	return p_set_memory_x && p_set_memory_nx && p_init_mm ? 0 : -ENOENT;
 }
 
 int fki_region_alloc(unsigned long size, struct fki_region *r)
@@ -451,13 +457,13 @@ static bool resv_used, carve_used;
 
 static void fki_reserve(void)
 {
-	unsigned long cnt = ALIGN(reserve_mb << 20, SZ_2M) >> PAGE_SHIFT;
+	unsigned long cnt = ALIGN(reserve_mb << 20, PMD_SIZE) >> PAGE_SHIFT;	/* in L2 blocks: 2 MiB (4 KB granule), 32 MiB (16 KB) */
 
 	if (carve_mb)
 		pr_info("fki: %lu MiB at %#lx for the foreign kernel's DRAM (outside the host's memory)\n", carve_mb, carve_base);
 	if (!reserve_mb || fki_resolve() || !p_cma_area || !*p_cma_area || !p_cma_alloc)
 		return;
-	resv_pg = p_cma_alloc(*p_cma_area, cnt, get_order(SZ_2M), true);
+	resv_pg = p_cma_alloc(*p_cma_area, cnt, get_order(PMD_SIZE), true);
 	if (resv_pg)
 		resv_cnt = cnt;
 	pr_info("fki: %lu MiB for the foreign kernel's DRAM %s\n", reserve_mb, resv_pg ? "reserved" : "NOT reserved (CMA)");
@@ -519,8 +525,9 @@ int fki_contig_alloc(unsigned long size, struct fki_region *r)
 
 	if (err)
 		return err;
-	if (carve_mb && !carve_used && ALIGN(size, SZ_2M) <= carve_mb << 20 && !(carve_base & (SZ_2M - 1))) {
-		unsigned long clen = ALIGN(size, SZ_2M);
+	/* whole L2 blocks (PMD_SIZE: 2 MiB with a 4 KB granule, 32 MiB with 16 KB): the foreign kernel maps its DRAM with them */
+	if (carve_mb && !carve_used && ALIGN(size, PMD_SIZE) <= carve_mb << 20 && !(carve_base & (PMD_SIZE - 1))) {
+		unsigned long clen = ALIGN(size, PMD_SIZE);
 		void *va;
 
 		err = fki_carve_check(carve_base, clen);
@@ -538,10 +545,10 @@ int fki_contig_alloc(unsigned long size, struct fki_region *r)
 		}
 		pr_warn("fki: carve-out at %#lx not mappable\n", carve_base);
 	}
-	if (resv_pg && !resv_used && ALIGN(size, SZ_2M) >> PAGE_SHIFT <= resv_cnt) {
+	if (resv_pg && !resv_used && ALIGN(size, PMD_SIZE) >> PAGE_SHIFT <= resv_cnt) {
 		resv_used = true;
 		r->va = page_address(resv_pg);
-		r->size = ALIGN(size, SZ_2M);
+		r->size = ALIGN(size, PMD_SIZE);
 		memset(r->va, 0, r->size);
 		r->pa = page_to_phys(resv_pg);
 		r->handle = (void *)((unsigned long)resv_pg | 2);	/* bit 1: the reservation, kept when freed */
@@ -549,12 +556,12 @@ int fki_contig_alloc(unsigned long size, struct fki_region *r)
 	}
 	/*
 	 * Large blocks (a hosted kernel's DRAM, GBs) come from the CMA area when there is one: a long-running host
-	 * fragments its memory with unmovable pages and alloc_contig_pages then fails. CMA blocks are 2 MiB aligned
-	 * and sized to 2 MiB; a CMA block's handle has bit 0 set.
+	 * fragments its memory with unmovable pages and alloc_contig_pages then fails. CMA blocks are L2-block aligned
+	 * and sized (PMD_SIZE); a CMA block's handle has bit 0 set.
 	 */
 	if (size >= (64UL << 20) && p_cma_area && *p_cma_area && p_cma_alloc && p_cma_release) {
-		unsigned long cnt = ALIGN(size, SZ_2M) >> PAGE_SHIFT;
-		pg = p_cma_alloc(*p_cma_area, cnt, get_order(SZ_2M), true);
+		unsigned long cnt = ALIGN(size, PMD_SIZE) >> PAGE_SHIFT;
+		pg = p_cma_alloc(*p_cma_area, cnt, get_order(PMD_SIZE), true);
 		if (pg) {
 			r->va = page_address(pg);
 			memset(r->va, 0, cnt << PAGE_SHIFT);
@@ -600,16 +607,42 @@ void fki_contig_free(struct fki_region *r)
 }
 EXPORT_SYMBOL(fki_contig_free);
 
+unsigned fki_page_shift(void)
+{
+	return PAGE_SHIFT;
+}
+EXPORT_SYMBOL(fki_page_shift);
+
+#if CONFIG_PGTABLE_LEVELS < 4
+#error "fki: the foreign window needs 4-level kernel page tables (48-bit VA)"
+#endif
+
+static inline void fki_tlb_flush_all(void)
+{
+	dsb(ishst);
+	__tlbi(vmalle1is);
+	dsb(ish);
+	isb();
+}
+
+/* The kernel half's L1 (pud) table for va: Linux's own walk, so 4 KB (L0: 512 entries) and 16 KB (L0: 2) granules alike */
 int fki_window_l1(unsigned long va, unsigned long long **l1_va, fki_u64 *l1_pa)
 {
-	u64 ttbr1 = read_sysreg(ttbr1_el1) & GENMASK_ULL(47, 1);
-	u64 *l0 = phys_to_virt(ttbr1 & ~0xfffULL);
-	u64 e = READ_ONCE(l0[(va >> 39) & 511]);
+	pgd_t *pgdp;
+	p4d_t *p4dp;
+	p4d_t p4d;
 
-	if ((e & 3) != 3)
+	if (fki_resolve())
 		return -ENOENT;
-	*l1_pa = e & GENMASK_ULL(47, 12);
-	*l1_va = phys_to_virt(*l1_pa);
+	pgdp = pgd_offset_pgd(p_init_mm->pgd, va);
+	if (pgd_none(READ_ONCE(*pgdp)))
+		return -ENOENT;
+	p4dp = p4d_offset(pgdp, va);
+	p4d = READ_ONCE(*p4dp);
+	if (p4d_none(p4d) || (p4d_val(p4d) & 3) != 3)
+		return -ENOENT;
+	*l1_pa = p4d_page_paddr(p4d);
+	*l1_va = (unsigned long long *)phys_to_virt(*l1_pa);
 	return 0;
 }
 EXPORT_SYMBOL(fki_window_l1);
@@ -617,12 +650,222 @@ EXPORT_SYMBOL(fki_window_l1);
 void fki_window_set(unsigned long long *slot, fki_u64 desc)
 {
 	WRITE_ONCE(*slot, desc);
-	dsb(ishst);
-	__tlbi(vmalle1is);
-	dsb(ish);
-	isb();
+	fki_tlb_flush_all();
 }
 EXPORT_SYMBOL(fki_window_set);
+
+/*
+ * The shared L1 entry (16 KB granule): which entries of Linux's L2 table fki_window_l2_set installed (the foreign kernel's
+ * bootstrap blocks), for one L2 table at a time, and the entry while the foreign kernel's own L2 table has it.
+ */
+static DECLARE_BITMAP(fki_l2_owned, PTRS_PER_PMD);
+static phys_addr_t fki_l2_owned_table;		/* the Linux L2 table those bits are of */
+static unsigned long fki_l2_adopted_va;		/* nonzero: the shared L1 entry for it points at the foreign kernel's L2 */
+static u64 fki_l2_adopted_old, fki_l2_adopted_new;
+static unsigned long long *fki_l2_adopted_cur;
+static unsigned fki_l2_adopted_lo, fki_l2_adopted_hi;
+
+static int fki_l1_entry(unsigned long va, u64 **slot)
+{
+	unsigned long long *l1;
+	fki_u64 l1pa;
+	int err = fki_window_l1(va, &l1, &l1pa);
+
+	if (err)
+		return err;
+	*slot = (u64 *)&l1[pud_index(va)];
+	return 0;
+}
+
+int fki_window_l2(unsigned long va, unsigned long long **l2_va, fki_u64 *l2_pa)
+{
+	u64 *l1e;
+	u64 e;
+	int err = fki_l1_entry(va, &l1e);
+
+	if (err)
+		return err;
+	e = READ_ONCE(*l1e);
+	if ((e & 3) != 3)	/* empty, or a block: not a table */
+		return -ENOENT;
+	*l2_pa = pud_page_paddr(__pud(e));
+	if (!pfn_valid(PHYS_PFN(*l2_pa)))	/* the foreign kernel's own (adopted): not in the linear map */
+		return -EBUSY;
+	*l2_va = (unsigned long long *)phys_to_virt(*l2_pa);
+	return 0;
+}
+EXPORT_SYMBOL(fki_window_l2);
+
+int fki_window_l2_set(unsigned long va, fki_u64 desc)
+{
+	unsigned long long *l2;
+	fki_u64 l2pa;
+	unsigned i = pmd_index(va);
+	int err = fki_resolve();
+
+	if (err)
+		return err;
+	spin_lock(&p_init_mm->page_table_lock);
+	err = fki_l2_adopted_va ? -EBUSY : fki_window_l2(va, &l2, &l2pa);
+	if (err)
+		goto out;
+	if (!bitmap_empty(fki_l2_owned, PTRS_PER_PMD) && fki_l2_owned_table != l2pa) {
+		err = -EBUSY;	/* bootstrap entries in another L2 table still installed */
+		goto out;
+	}
+	if (desc) {
+		if (READ_ONCE(l2[i])) {
+			err = -EBUSY;	/* Linux's (or already ours) */
+			goto out;
+		}
+		WRITE_ONCE(l2[i], desc);
+		__set_bit(i, fki_l2_owned);
+		fki_l2_owned_table = l2pa;
+	} else {
+		if (!test_bit(i, fki_l2_owned)) {
+			err = READ_ONCE(l2[i]) ? -EPERM : 0;	/* never clear an entry of Linux's */
+			goto out;
+		}
+		WRITE_ONCE(l2[i], 0);
+		__clear_bit(i, fki_l2_owned);
+	}
+	fki_tlb_flush_all();
+out:
+	spin_unlock(&p_init_mm->page_table_lock);
+	return err;
+}
+EXPORT_SYMBOL(fki_window_l2_set);
+
+int fki_window_l2_adopt(unsigned long va, unsigned long long *new_l2_va, fki_u64 new_desc, unsigned lo, unsigned hi,
+			fki_u64 *old_desc)
+{
+	unsigned long long *l2;
+	fki_u64 l2pa;
+	u64 *l1e;
+	u64 old;
+	unsigned i;
+	int err;
+
+	if (lo >= hi || hi > PTRS_PER_PMD || !new_l2_va || (new_desc & 3) != 3)
+		return -EINVAL;
+	if (fki_resolve())
+		return -ENOENT;
+	spin_lock(&p_init_mm->page_table_lock);
+	err = fki_l2_adopted_va ? -EBUSY : fki_l1_entry(va, &l1e);
+	if (err)
+		goto out;
+	old = READ_ONCE(*l1e);
+	err = fki_window_l2(va, &l2, &l2pa);
+	if (err)
+		goto out;
+	if (!bitmap_empty(fki_l2_owned, PTRS_PER_PMD) && fki_l2_owned_table != l2pa) {
+		err = -EBUSY;
+		goto out;
+	}
+	/* the foreign kernel's range: Linux has nothing there but the bootstrap blocks */
+	for (i = lo; i < hi; i++) {
+		if (READ_ONCE(l2[i]) && !test_bit(i, fki_l2_owned)) {
+			pr_err("fki: L2 entry %u of the shared L1 entry for %#lx is Linux's (%#llx): not adopting\n", i, va,
+			       (unsigned long long)READ_ONCE(l2[i]));
+			err = -EBUSY;
+			goto out;
+		}
+	}
+	/* Linux's entries outside it go into the new table, which has nothing there */
+	for (i = 0; i < PTRS_PER_PMD; i++) {
+		u64 e;
+
+		if (i >= lo && i < hi)
+			continue;
+		e = READ_ONCE(l2[i]);
+		if (!e)
+			continue;
+		if (new_l2_va[i] && new_l2_va[i] != e) {
+			pr_err("fki: the foreign L2 table has entry %u (%#llx) where Linux has %#llx: not adopting\n", i,
+			       new_l2_va[i], (unsigned long long)e);
+			err = -EBUSY;
+			goto out;
+		}
+	}
+	for (i = 0; i < PTRS_PER_PMD; i++) {
+		u64 e;
+
+		if (i >= lo && i < hi)
+			continue;
+		e = READ_ONCE(l2[i]);
+		if (e) {
+			WRITE_ONCE(new_l2_va[i], e);
+			pr_info("fki: shared L1 entry for %#lx: Linux's L2 entry %u (%#llx) kept in the foreign table\n", va, i,
+				(unsigned long long)e);
+		}
+	}
+	dsb(ishst);
+	/* one store: every walk sees Linux's table (bootstrap blocks) or the new one (the foreign kernel's own tables) */
+	WRITE_ONCE(*l1e, new_desc);
+	fki_tlb_flush_all();
+	for (i = lo; i < hi; i++) {
+		if (test_bit(i, fki_l2_owned)) {
+			WRITE_ONCE(l2[i], 0);
+			__clear_bit(i, fki_l2_owned);
+		}
+	}
+	fki_tlb_flush_all();
+	fki_l2_adopted_va = va;
+	fki_l2_adopted_old = old;
+	fki_l2_adopted_new = new_desc;
+	fki_l2_adopted_cur = new_l2_va;
+	fki_l2_adopted_lo = lo;
+	fki_l2_adopted_hi = hi;
+	*old_desc = old;
+out:
+	spin_unlock(&p_init_mm->page_table_lock);
+	return err;
+}
+EXPORT_SYMBOL(fki_window_l2_adopt);
+
+static void fki_window_l2_restore_locked(unsigned long va, unsigned long long *cur_l2_va, fki_u64 old_desc, unsigned lo,
+					 unsigned hi)
+{
+	unsigned long long *l2;
+	phys_addr_t l2pa = pud_page_paddr(__pud(old_desc));
+	u64 *l1e;
+	unsigned i;
+
+	if (fki_l1_entry(va, &l1e) || (old_desc & 3) != 3 || !pfn_valid(PHYS_PFN(l2pa))) {
+		pr_err("fki: cannot restore the shared L1 entry for %#lx (old %#llx)\n", va, (unsigned long long)old_desc);
+		return;
+	}
+	if (READ_ONCE(*l1e) != fki_l2_adopted_new)
+		pr_warn("fki: shared L1 entry for %#lx is %#llx, not the foreign table's %#llx: restoring Linux's anyway\n", va,
+			(unsigned long long)READ_ONCE(*l1e), (unsigned long long)fki_l2_adopted_new);
+	l2 = (unsigned long long *)phys_to_virt(l2pa);
+	for (i = 0; i < PTRS_PER_PMD; i++) {
+		if (i >= lo && i < hi)
+			WRITE_ONCE(l2[i], 0);
+		else if (cur_l2_va && READ_ONCE(cur_l2_va[i]) != READ_ONCE(l2[i]))
+			WRITE_ONCE(l2[i], READ_ONCE(cur_l2_va[i]));	/* what Linux changed there meanwhile */
+	}
+	dsb(ishst);
+	WRITE_ONCE(*l1e, old_desc);
+	fki_tlb_flush_all();
+	fki_l2_adopted_va = 0;
+	fki_l2_adopted_cur = NULL;
+	pr_info("fki: shared L1 entry for %#lx back to Linux's L2 table (%#llx)\n", va, (unsigned long long)old_desc);
+}
+
+void fki_window_l2_restore(unsigned long va, unsigned long long *cur_l2_va, fki_u64 old_desc, unsigned lo, unsigned hi)
+{
+	if (fki_resolve()) {
+		pr_err("fki: cannot restore the shared L1 entry for %#lx\n", va);
+		return;
+	}
+	spin_lock(&p_init_mm->page_table_lock);
+	if (!fki_l2_adopted_va || fki_l2_adopted_va != va)
+		pr_warn("fki: restoring the shared L1 entry for %#lx, which fki did not hand over\n", va);
+	fki_window_l2_restore_locked(va, cur_l2_va, old_desc, lo, hi);
+	spin_unlock(&p_init_mm->page_table_lock);
+}
+EXPORT_SYMBOL(fki_window_l2_restore);
 
 /*
  * Letting Linux run (IRQs on, maybe a reschedule) from inside fki_enter() happens on whatever stack the foreign kernel
@@ -991,6 +1234,13 @@ static int __init fki_init(void)
 
 static void __exit fki_exit(void)
 {
+	if (fki_l2_adopted_va) {	/* a foreign module left without handing the shared L1 entry back */
+		spin_lock(&p_init_mm->page_table_lock);
+		if (fki_l2_adopted_va)
+			fki_window_l2_restore_locked(fki_l2_adopted_va, NULL, fki_l2_adopted_old, fki_l2_adopted_lo,
+						     fki_l2_adopted_hi);
+		spin_unlock(&p_init_mm->page_table_lock);
+	}
 	fki_hostcall_exit();
 	if (resv_pg && !resv_used)
 		p_cma_release(*p_cma_area, resv_pg, resv_cnt);

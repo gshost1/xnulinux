@@ -61,11 +61,38 @@ void fki_random(void *buf, unsigned long len);
 int fki_contig_alloc(unsigned long size, struct fki_region *r);
 void fki_contig_free(struct fki_region *r);
 /*
- * The top foreign window: the L1 table that Linux's TTBR1 L0 entry for va points to. A foreign kernel may
- * own L1 entries Linux leaves empty in that table; fki_window_set installs one (then a full TLB flush).
+ * The host's translation granule: 12 (4 KB) or 14 (16 KB). A table holds 1 << (shift - 3) descriptors; an L2 entry maps
+ * 1 << (2 * shift - 3) bytes (2 MiB, 32 MiB), an L1 entry 1 << (3 * shift - 6) (1 GiB, 64 GiB).
+ */
+unsigned fki_page_shift(void);
+/*
+ * The top foreign window: the L1 table (Linux's pud table) that the kernel half's top-level entry for va points to, with
+ * 4 KB and 16 KB granules alike. A foreign kernel may own L1 entries Linux leaves empty in that table; fki_window_set
+ * installs one (then a full TLB flush).
  */
 int fki_window_l1(unsigned long va, unsigned long long **l1_va, fki_u64 *l1_pa);
 void fki_window_set(unsigned long long *slot, fki_u64 desc);
+/*
+ * An L1 entry Linux shares with the foreign window (16 KB granule: one L1 entry spans 64 GiB, and Linux's fixmap and PCI I/O
+ * sit in the same one as the foreign kernel's top): the L2 table it points to (-ENOENT when the entry is not a table).
+ */
+int fki_window_l2(unsigned long va, unsigned long long **l2_va, fki_u64 *l2_pa);
+/*
+ * One L2 entry of that table for va (the foreign kernel's bootstrap blocks), under Linux's kernel page-table lock, then a full
+ * TLB flush. Refuses (-EBUSY) an entry Linux has in use; desc 0 clears an entry this call installed.
+ */
+int fki_window_l2_set(unsigned long va, fki_u64 desc);
+/*
+ * Hand the shared L1 entry for va to the foreign kernel's own L2 table (new_l2_va, mapped by the caller; new_desc the L1
+ * descriptor pointing at it): its entries [lo, hi) are the foreign kernel's, every other entry Linux has in its table is
+ * copied into the new table first (which must have nothing there). Refuses when Linux has anything in [lo, hi) but the
+ * bootstrap entries fki_window_l2_set installed; those are cleared from Linux's table once the new one is live. *old_desc:
+ * Linux's descriptor, for fki_window_l2_restore. Callable with interrupts off.
+ */
+int fki_window_l2_adopt(unsigned long va, unsigned long long *new_l2_va, fki_u64 new_desc, unsigned lo, unsigned hi,
+			fki_u64 *old_desc);
+/* Back to Linux's own L2 table: its entries outside [lo, hi) as they are now in cur_l2_va, [lo, hi) empty, then old_desc. */
+void fki_window_l2_restore(unsigned long va, unsigned long long *cur_l2_va, fki_u64 old_desc, unsigned lo, unsigned hi);
 /*
  * Called from inside fki_enter() (preemption and IRQs off): let Linux run (IRQs and preemption on)
  * until the counter reaches deadline or max_ns pass, or fki_kick_cpu() is called for this CPU, then return with them off

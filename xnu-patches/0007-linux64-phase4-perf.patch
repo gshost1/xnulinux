@@ -1,0 +1,1055 @@
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index 08fb82f..43f7df1 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -232,8 +232,24 @@ extern vm_offset_t segLOWESTRXAuxKC, segHIGHESTRXAuxKC, segHIGHESTNLEAuxKC;
+ /* LINUX64 (xnulinux): the hosted machine layer's state (linux64/linux64.h), set by xnu.ko before arm_init */
+ uintptr_t linux64_hook;
+ uintptr_t linux64_slide;
+-unsigned int linux64_vint[LINUX64_CPU_SLOTS];
+-unsigned int linux64_ipi_pending[LINUX64_CPU_SLOTS];
++struct linux64_pcpu linux64_pcpu[LINUX64_PCPU_LINES];	/* each CPU's line: linux64/linux64.h */
++unsigned char linux64_pcpu_index[LINUX64_CPU_SLOTS];
++
++void
++linux64_pcpu_assign(unsigned long mpidr)
++{
++	static unsigned int next = 1;	/* line 0: the boot CPU's */
++	const unsigned int slot = LINUX64_CPU_SLOT(mpidr);
++
++	if (linux64_pcpu_index[slot] != 0 || slot == linux64_cpu_slot()) {
++		return;
++	}
++	if (next >= LINUX64_PCPU_LINES) {
++		panic("linux64: more CPUs than per-CPU lines (%d)", LINUX64_PCPU_LINES);
++	}
++	linux64_pcpu_index[slot] = (unsigned char)next++;
++	os_atomic_thread_fence(release);
++}
+ unsigned long linux64_dbg[LINUX64_NCOUNTERS];
+ /* LINUX64: the translation granule this kernel was built for (12: 4 KB, 14: 16 KB); xnu.ko refuses a host of another one */
+ const unsigned int linux64_granule_shift = ARM_PGSHIFT;
+diff --git a/osfmk/arm/machine_routines_common.c b/osfmk/arm/machine_routines_common.c
+index 0ff7731..dce5a31 100644
+--- a/osfmk/arm/machine_routines_common.c
++++ b/osfmk/arm/machine_routines_common.c
+@@ -1102,23 +1102,27 @@ ml_set_interrupts_enabled_with_debug(boolean_t enable, boolean_t __unused debug)
+ 		 * XNU's view in linux64_vint (per CPU); timer "interrupts" are delivered from cpu_idle.
+ 		 */
+ 		if (linux64_hook) {
+-			unsigned int slot = linux64_cpu_slot();
+-			boolean_t was = linux64_vint[slot] ? TRUE : FALSE;
++			struct linux64_pcpu *pc = linux64_pcpu_self();
++			boolean_t was = pc->vint ? TRUE : FALSE;
+ 			if (enable && !was) {
+ 				/*
+ 				 * Kernel code that runs long without going to user space or idle never sees a host interrupt
+ 				 * (hardware IRQs stay masked in XNU's kernel), which stalls Linux (RCU) and stops XNU's own
+ 				 * clock. Where XNU would take a pending interrupt, re-enabling interrupts, let Linux run its
+-				 * interrupts every 2 ms and deliver XNU's timer if it is due, as the IRQ path does; and take an
+-				 * IPI another CPU sent.
++				 * interrupts every 8 ms and deliver XNU's timer if it is due, as the IRQ path does; and take an
++				 * IPI another CPU sent. The 8 ms is measured on the raw counter (no isb, no scaling: this runs on
++				 * every enable, millions of times a second).
+ 				 */
+-				static uint64_t linux64_last_kyield[LINUX64_CPU_SLOTS];
+-				uint64_t now = mach_absolute_time();
++				static uint64_t linux64_kyield_ticks;
+ 				cpu_data_t *cdp = thread->machine.CpuDatap;
+ 				if (cdp->cpu_int_state == NULL) {
+-					if (now - linux64_last_kyield[slot] > 192000) {
++					const uint64_t now = __builtin_arm_rsr64("CNTVCT_EL0");
++					if (__improbable(linux64_kyield_ticks == 0)) {
++						linux64_kyield_ticks = __builtin_arm_rsr64("CNTFRQ_EL0") * 8 / 1000;
++					}
++					if (__improbable(now - pc->last_kyield > linux64_kyield_ticks)) {
+ 						extern void rtclock_intr(unsigned int);
+-						linux64_last_kyield[slot] = now;
++						pc->last_kyield = now;
+ 						/*
+ 						 * Not with preemption off (a spinlock held): Linux may reschedule this CPU's thread
+ 						 * away for as long as it likes, and every other CPU spins on the lock until XNU's
+@@ -1140,9 +1144,9 @@ ml_set_interrupts_enabled_with_debug(boolean_t enable, boolean_t __unused debug)
+ 					}
+ 				}
+ 				/* ast_taken_kernel may have switched this thread out: it can be back on another CPU */
+-				linux64_vint[linux64_cpu_slot()] = 1;
++				linux64_pcpu_self()->vint = 1;
+ 			} else if (!enable) {
+-				linux64_vint[slot] = 0;
++				pc->vint = 0;
+ 			}
+ 			return was;
+ 		}
+@@ -1430,55 +1434,81 @@ ml_early_cpu_max_number(void)
+  * LINUX64 (xnulinux): called from spin-waits (wait_for_event, the cross-call wait). The CPU being waited for may be
+  * held by the host: in a call into it (file I/O, idle) or running Linux there. On hardware this CPU would take
+  * interrupts meanwhile; hosted, with interrupts masked here, the host would never get this CPU back, and if the other
+- * CPU's host side waits for this one (an IPI, a lock), neither moves. So every ~1 ms of spinning the host takes this
+- * CPU's interrupts (LINUX64_CALL_PREEMPTED). Nothing of XNU's runs here (no IPI, no AST): the spinning code may hold
+- * per-CPU lock state that a context switch would break.
++ * CPU's host side waits for this one (an IPI, a lock), neither moves. So after each ~1 ms of continuous spinning the
++ * host takes this CPU's interrupts (LINUX64_CALL_PREEMPTED); a spin-wait that ends sooner never calls the host (a call
++ * more than LINUX64_RELAX_GAP_US after the previous one starts a new spin). Nothing of XNU's runs here (no IPI, no
++ * AST): the spinning code may hold per-CPU lock state that a context switch would break.
+  */
+-static uint64_t linux64_last_relax[LINUX64_CPU_SLOTS];
++#define LINUX64_RELAX_GAP_US	1000	/* >= LINUX64_RELAX_US so slow periodic wakeups cannot reset spin tracking */
++#define LINUX64_RELAX_US	1000
++static uint64_t linux64_relax_gap_ticks, linux64_relax_ticks;
+ void
+ linux64_spin_relax(void)
+ {
+-	unsigned int slot = linux64_cpu_slot();
+-	uint64_t now = mach_absolute_time();
++	struct linux64_pcpu *pc = linux64_pcpu_self();
++	const uint64_t now = __builtin_arm_rsr64("CNTVCT_EL0");	/* raw counter: an interval, no isb or scaling */
+ 
+-	if (now - linux64_last_relax[slot] < 24000) {     /* ~1 ms of the 24 MHz timebase */
++	if (__improbable(linux64_relax_ticks == 0)) {
++		const uint64_t f = __builtin_arm_rsr64("CNTFRQ_EL0");
++		linux64_relax_gap_ticks = f * LINUX64_RELAX_GAP_US / 1000000;
++		linux64_relax_ticks = f * LINUX64_RELAX_US / 1000000;
++	}
++	if (now - pc->last_relax > linux64_relax_gap_ticks) {
++		pc->relax_start = now;
++	}
++	pc->last_relax = now;
++	if (now - pc->relax_start < linux64_relax_ticks) {
+ 		return;
+ 	}
+-	linux64_last_relax[slot] = now;
++	pc->relax_start = now;
+ 	linux64_call2(LINUX64_CALL_PREEMPTED, 1, 0);
+ 	/*
+ 	 * Spinning with XNU's interrupts enabled, a CPU takes another CPU's IPI on hardware (its FIQ): the other may be
+ 	 * waiting for exactly that (a cross-call's acknowledgment) before it lets go of what this one spins on. Take a
+ 	 * pending one here as the FIQ would, interrupts off around the handler; no AST, no context switch.
+ 	 */
+-	if (linux64_vint[slot] && getCpuDatap()->cpu_int_state == NULL) {
+-		linux64_vint[slot] = 0;
++	pc = linux64_pcpu_self();
++	if (pc->vint && getCpuDatap()->cpu_int_state == NULL) {
++		pc->vint = 0;
+ 		linux64_ipi_take();
+-		linux64_vint[slot] = 1;
++		pc->vint = 1;
+ 	}
+ }
+ 
+ void
+ linux64_ipi_take(void)
+ {
+-	unsigned int slot = linux64_cpu_slot();
++	struct linux64_pcpu *pc = linux64_pcpu_self();
+ 
+-	if (os_atomic_load(&linux64_ipi_pending[slot], relaxed) && os_atomic_xchg(&linux64_ipi_pending[slot], 0, acquire)) {
++	if (os_atomic_load(&pc->ipi_pending, relaxed) && os_atomic_xchg(&pc->ipi_pending, 0, acquire)) {
+ 		cpu_signal_handler();
+ 	}
+ }
+ 
++/*
++ * LINUX64 (xnulinux): inter-processor interrupts while hosted. The sender sets the target's pending word and asks the
++ * host to make the target look (wake it from its idle call, or interrupt its user code); the target takes it where its
++ * interrupts are enabled again (ml_set_interrupts_enabled), when the host interrupted its user code, and after idle,
++ * as the IPI's FIQ would be taken on hardware: cpu_signal_handler, with interrupts off. A target polling its pending
++ * word in cpu_idle (linux64_cpu_idle) sees it without the host: no host call, and no IPI through the hypervisor.
++ */
+ void
+ linux64_cpu_signal(unsigned int cpu)
+ {
+ 	cpu_data_t *target = CpuDataEntries[cpu].cpu_data_vaddr;
++	struct linux64_pcpu *pc;
+ 	uint64_t mpidr;
+ 
+ 	if (target == NULL) {
+ 		return;
+ 	}
+ 	mpidr = target->cpu_phys_id;
+-	os_atomic_store(&linux64_ipi_pending[LINUX64_CPU_SLOT(mpidr)], 1, release);
++	pc = linux64_pcpu_of_slot(LINUX64_CPU_SLOT(mpidr));
++	os_atomic_store(&pc->ipi_pending, 1, release);
++	os_atomic_thread_fence(seq_cst);	/* the pending word, then polling: pairs with linux64_cpu_idle */
++	if (os_atomic_load(&pc->polling, relaxed)) {
++		return;
++	}
+ 	linux64_call2(LINUX64_CALL_IPI, mpidr, 0);
+ }
+ 
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 3b294b8..ea1cbd0 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -80,6 +80,7 @@
+ #include <arm/machine_cpu.h>
+ #include <arm/misc_protos.h>
+ #include <arm/pmap/pmap_internal.h>
++#include <linux64/linux64.h>
+ #include <arm/trap_internal.h>
+ 
+ #include <arm64/proc_reg.h>
+@@ -10595,6 +10596,59 @@ static_assert(ARM64_FULL_TLB_FLUSH_THRESHOLD < (1ULL << (sizeof(ppnum_t) * 8)),
+     "ARM64_FULL_TLB_FLUSH_THRESHOLD is too large so that the integer conversion"
+     "of npages to 32 bits below may truncate.");
+ 
++/*
++ * LINUX64 (xnulinux): TLB invalidation by range (FEAT_TLBIRANGE: ID_AA64ISAR0_EL1.TLB >= 2; boot-arg linux64_rtlbi=0
++ * turns it off). Under a hypervisor that broadcasts every TLB invalidation (HCR_EL2.FB), each per-page invalidation
++ * costs ~90 ns and a whole range ~450 ns (Neoverse V2): one range instruction replaces the per-page loop of any region
++ * above two pages, and keeps the ASID's other entries that the full flush above 256 pages drops. Same ASID matching
++ * as the loops it replaces: the region's ASID (global entries too), all ASIDs for a nested (shared region) pmap.
++ */
++#define LINUX64_RTLBI_MAX_PAGES	(1ULL << 21)	/* (NUM + 1) * 2^(5 * SCALE + 1) with SCALE 3, NUM 31 */
++static TUNABLE(uint32_t, linux64_rtlbi_arg, "linux64_rtlbi", 1);
++static int linux64_rtlbi_hw = -1;
++
++static inline bool
++linux64_rtlbi_ok(void)
++{
++	if (__improbable(linux64_rtlbi_hw < 0)) {
++		linux64_rtlbi_hw = (linux64_hook && ((__builtin_arm_rsr64("ID_AA64ISAR0_EL1") >> 56) & 0xf) >= 2) ? 1 : 0;
++	}
++	return linux64_rtlbi_hw == 1 && linux64_rtlbi_arg != 0;
++}
++
++/* the operand for npages (> 1) pages from va: BaseADDR <= VA < BaseADDR + (NUM + 1) * 2^(5 * SCALE + 1) pages */
++static inline uint64_t
++linux64_rtlbi_param(uint64_t npages, uint32_t asid, vm_offset_t va, uint64_t pg_shift)
++{
++	const unsigned order = 63 - (unsigned)__builtin_clzll(npages - 1);	/* floor(log2(npages - 1)) */
++	const unsigned scale = ((order ? order : 1) - 1) / 5;
++	const uint64_t granule = 1ULL << (5 * scale + 1);
++	const uint64_t num = ((npages + granule - 1) & ~(granule - 1)) / granule - 1;
++
++	return ((uint64_t)asid << TLBI_ASID_SHIFT) | RTLBI_TG(pg_shift) | ((uint64_t)scale << RTLBI_SCALE_SHIFT) |
++	       (num << RTLBI_NUM_SHIFT) | ((va >> pg_shift) & RTLBI_ADDR_MASK);
++}
++
++static inline void
++linux64_rtlbi_asid(uint64_t op, bool last_level_only)
++{
++	if (last_level_only) {
++		asm volatile ("tlbi rvale1is, %0" : : "r"(op));
++	} else {
++		asm volatile ("tlbi rvae1is, %0" : : "r"(op));
++	}
++}
++
++static inline void
++linux64_rtlbi_all_asids(uint64_t op, bool last_level_only)
++{
++	if (last_level_only) {
++		asm volatile ("tlbi rvaale1is, %0" : : "r"(op));
++	} else {
++		asm volatile ("tlbi rvaae1is, %0" : : "r"(op));
++	}
++}
++
+ static void
+ flush_mmu_tlb_region_asid_async(
+ 	vm_offset_t va,
+@@ -10610,6 +10664,20 @@ flush_mmu_tlb_region_asid_async(
+ 
+ 	asid = pmap->hw_asid;
+ 
++	if (linux64_rtlbi_ok() && npages > 2) {
++		/* LINUX64 (xnulinux): one range invalidation for the whole region (pmap-rtlbi above) */
++		const uint64_t first = va >> pmap_page_shift, last = (va + length + pmap_page_size - 1) >> pmap_page_shift;
++		if (last - first <= LINUX64_RTLBI_MAX_PAGES) {
++			const uint64_t op = linux64_rtlbi_param(last - first, asid, va, pmap_page_shift);
++			if (pmap->type == PMAP_TYPE_NESTED) {
++				linux64_rtlbi_all_asids(op, last_level_only);
++			} else {
++				linux64_rtlbi_asid(op, last_level_only);
++			}
++			return;
++		}
++	}
++
+ 	if (npages > ARM64_FULL_TLB_FLUSH_THRESHOLD) {
+ 		boolean_t       flush_all = FALSE;
+ 
+diff --git a/osfmk/arm64/arm64_hypercall.c b/osfmk/arm64/arm64_hypercall.c
+index 1293e10..1e569c2 100644
+--- a/osfmk/arm64/arm64_hypercall.c
++++ b/osfmk/arm64/arm64_hypercall.c
+@@ -301,7 +301,6 @@ hvg_hc_wait_for_kick(unsigned int ien)
+  * the CPU and take its IPIs) until the holder's unlock kicks it, instead of spinning with every interrupt masked. The
+  * wait is bounded (1 ms) and may end early: the caller looks at the lock again either way.
+  */
+-static unsigned int linux64_pv_kicked[LINUX64_CPU_SLOTS];
+ 
+ bool
+ hvg_is_hcall_available(hvg_hcall_code_t hcall)
+@@ -317,18 +316,18 @@ hvg_hc_kick_cpu(unsigned int cpu_id)
+ 	if (target == NULL) {
+ 		return;
+ 	}
+-	os_atomic_store(&linux64_pv_kicked[LINUX64_CPU_SLOT(target->cpu_phys_id)], 1, release);
++	os_atomic_store(&linux64_pcpu_of_slot(LINUX64_CPU_SLOT(target->cpu_phys_id))->pv_kicked, 1, release);
+ 	linux64_call2(LINUX64_CALL_IPI, target->cpu_phys_id, 0);	/* the host wakes that CPU; no XNU IPI is pending */
+ }
+ 
+ void
+ hvg_hc_wait_for_kick(__unused unsigned int ien)
+ {
+-	unsigned int slot = linux64_cpu_slot();
++	struct linux64_pcpu *pc = linux64_pcpu_self();
+ 
+-	if (!os_atomic_xchg(&linux64_pv_kicked[slot], 0, acquire)) {
+-		linux64_call2(LINUX64_CALL_IDLE, 1000000, (unsigned long)&linux64_pv_kicked[slot]);
+-		os_atomic_store(&linux64_pv_kicked[slot], 0, relaxed);
++	if (!os_atomic_xchg(&pc->pv_kicked, 0, acquire)) {
++		linux64_call2(LINUX64_CALL_IDLE, 1000000, (unsigned long)&pc->pv_kicked);
++		os_atomic_store(&pc->pv_kicked, 0, relaxed);
+ 	}
+ }
+ 
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index 0c3e1ed..5438c8c 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -502,18 +502,36 @@ wfe_to_deadline_or_interrupt(uint32_t cid, uint64_t wfe_deadline, cpu_data_t *cd
+ }
+ 
+ /*
+- * LINUX64 (xnulinux): hosted, idle goes straight to the host, which runs Linux until XNU's next timer deadline and
+- * comes back; the due timer is then delivered here as its interrupt would be. No WFE/WFI and no timer interrupt of
+- * XNU's own apply (idle_enable stays FALSE without the CPU kext: cpu_machine_init never runs).
++ * LINUX64 (xnulinux): hosted, idle goes to the host, which runs Linux until XNU's next timer deadline and comes back;
++ * the due timer is then delivered here as its interrupt would be. No WFE/WFI and no timer interrupt of XNU's own apply
++ * (idle_enable stays FALSE without the CPU kext: cpu_machine_init never runs).
++ *
++ * Another CPU's wakeup often follows soon (a reply, the other end of a pipe): the CPU first polls its pending-IPI word
++ * for up to linux64_idle_poll_us (boot-arg, default 10; 0: off; longer windows measured no better). The host's sleep and wakeup cost tens of microseconds
++ * and the sender an IPI through the hypervisor; while this CPU polls, linux64_cpu_signal only sets the word. The
++ * host's interrupts on this CPU wait at most that long.
+  */
+-static void
++static uint64_t linux64_idle_poll_ticks = ~0ULL;	/* ~0: not read yet */
++static uint64_t linux64_idle_poll_ns;
++
++__attribute__((noreturn)) static void
+ linux64_cpu_idle(cpu_data_t *cpu_data_ptr)
+ {
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t deadline = cpu_data_ptr->rtcPop;
+ 	uint64_t ns = 0;	/* a timer already due: no sleep, only let Linux take its interrupts */
++	struct linux64_pcpu *pc = linux64_pcpu_self();	/* the idle thread stays on its CPU */
++	bool woken = false;
+ 
+ 	linux64_count(LINUX64_CTR_CPU_IDLE);
++	if (__improbable(linux64_idle_poll_ticks == ~0ULL)) {
++		unsigned int us = 10;
++		if (!PE_parse_boot_argn("linux64_idle_poll_us", &us, sizeof(us))) {
++			us = 10;
++		}
++		linux64_idle_poll_ns = (uint64_t)us * NSEC_PER_USEC;
++		linux64_idle_poll_ticks = __builtin_arm_rsr64("CNTFRQ_EL0") * us / USEC_PER_SEC;
++	}
+ 	if (deadline == 0 || deadline == EndOfAllTime) {
+ 		ns = NSEC_PER_MSEC;	/* no timer armed: check the run queue again in 1 ms */
+ 	} else if (deadline > now) {
+@@ -523,11 +541,25 @@ linux64_cpu_idle(cpu_data_t *cpu_data_ptr)
+ 	if (linux64_dbg[LINUX64_CTR_DUMP_REQ] && os_atomic_xchg(&linux64_dbg[LINUX64_CTR_DUMP_REQ], 0, relaxed)) {
+ 		linux64_dump_threads();	/* the host asked: who is blocked, and where */
+ 	}
+-	linux64_count(LINUX64_CTR_HOST_IDLE);
+-	linux64_call2(LINUX64_CALL_IDLE, ns, (unsigned long)&linux64_ipi_pending[linux64_cpu_slot()]);
++	if (linux64_idle_poll_ticks && ns > linux64_idle_poll_ns) {
++		const uint64_t t0 = __builtin_arm_rsr64("CNTVCT_EL0");
++		os_atomic_store(&pc->polling, 1, relaxed);
++		os_atomic_thread_fence(seq_cst);	/* polling, then the pending word: pairs with linux64_cpu_signal */
++		while (!os_atomic_load(&pc->ipi_pending, relaxed) && __builtin_arm_rsr64("CNTVCT_EL0") - t0 < linux64_idle_poll_ticks) {
++			__builtin_arm_yield();
++		}
++		os_atomic_store(&pc->polling, 0, relaxed);
++		os_atomic_thread_fence(seq_cst);	/* a sender that saw polling set left no host IPI: look once more */
++		woken = os_atomic_load(&pc->ipi_pending, relaxed) != 0;
++		ns -= linux64_idle_poll_ns;	/* not woken: the whole window went by (ns was above it) */
++	}
++	if (!woken) {
++		linux64_count(LINUX64_CTR_HOST_IDLE);
++		linux64_call2(LINUX64_CALL_IDLE, ns, (unsigned long)&pc->ipi_pending);
++	}
+ 	cpu_data_ptr->cpu_decrementer = -1;
+ 	rtclock_intr(FALSE);
+-	linux64_ipi_take();		/* what woke the host's idle call early, if it was another CPU */
++	linux64_ipi_take();		/* what woke this CPU (or the host's idle call early), if it was another CPU */
+ 	ClearIdlePop(TRUE);
+ 	cpu_idle_exit(FALSE);
+ }
+@@ -1047,6 +1079,7 @@ cpu_start(int cpu)
+ 
+ 		if (linux64_hook) {
+ 			/* LINUX64 (xnulinux): the host starts the CPU, on a Linux CPU of that MPIDR, at linux64_cpu_entry */
++			linux64_pcpu_assign(cpu_data_ptr->cpu_phys_id);	/* its per-CPU line, before it runs */
+ 			linux64_call2(LINUX64_CALL_CPU_START, cpu_data_ptr->cpu_phys_id, (unsigned long)cpu_data_ptr);
+ 		} else {
+ 			PE_cpu_start_internal(cpu_data_ptr->cpu_id, (vm_offset_t)NULL, (vm_offset_t)NULL);
+diff --git a/osfmk/arm64/cswitch.s b/osfmk/arm64/cswitch.s
+index 04b6309..1c8d3c0 100644
+--- a/osfmk/arm64/cswitch.s
++++ b/osfmk/arm64/cswitch.s
+@@ -444,16 +444,22 @@ LEXT(machine_set_current_thread)
+ /* vim: set ts=4: */
+ 
+ /*
+- * LINUX64 (xnulinux): user space while hosted. linux64_el0_run(ss) enters EL0 with the user state in ss
+- * (IRQs stay masked at EL0), on this CPU, with VBAR_EL1 pointing at linux64_el0_vectors and SP_EL0 holding the
+- * user sp. What the kernels need back on the next exception from EL0 (XNU's thread pointer, which TPIDRRO_EL0 holds in
+- * the kernel and the user's TSD at EL0; Linux's vectors, its `current` in SP_EL0, its shadow call stack in x18 and
+- * SCTLR_EL1) goes in a block at the top of the thread's kernel stack, where SP_EL1 points at that exception: per thread,
+- * so per CPU. The exception builds a register frame below it, puts all that back and calls
+- * linux64_el0_exception(frame) (sleh.c), which hands it to sleh_synchronous and returns to user space again.
++ * LINUX64 (xnulinux): user space while hosted. linux64_el0_run(ctx, jop_off) enters EL0 with the user state in ctx (the
++ * thread's arm_context_t: ss, then ns), on this CPU, with VBAR_EL1 pointing at linux64_el0_vectors and SP_EL0 holding
++ * the user sp (IRQs stay unmasked at EL0, FIQs masked). What the kernels need back on the next exception from EL0
++ * (XNU's thread pointer, which TPIDRRO_EL0 holds in the kernel and the user's TSD at EL0; Linux's vectors, its `current`
++ * in SP_EL0, its shadow call stack in x18 and SCTLR_EL1) goes in a block at the top of the thread's kernel stack, where
++ * SP_EL1 points at that exception: per thread, so per CPU. The exception saves the user registers straight into ctx, as
++ * locore's exception entry saves them into the PCB, puts the kernels' registers back and calls
++ * linux64_el0_exception(esr, far) (sleh.c), which signs the saved state, hands it to sleh_synchronous and returns to
++ * user space again. mach_absolute_time and mach_continuous_time, the traps a scaled timebase sends user space through,
++ * are answered in the vector itself (Llinux64_el0_time), as the commpage answers them on hardware.
+  */
+-#define LINUX64_EL0_BLOCK	64		// thread, SP_EL0, VBAR_EL1, x18, SCTLR_EL1
+-#define LINUX64_EL0_FRAME	(36 * 8 + 528)	// struct linux64_el0_frame (sleh.c)
++#define LINUX64_EL0_BLOCK	64		// thread, SP_EL0, VBAR_EL1, x18, SCTLR_EL1, JOP off, arm_context_t, unused
++#define L64_SS_X(n)		(SS64_X0 + (n) * 8)
++#define L64_TB_MAGIC		16		// struct linux64_tb_scale (linux64.h): num, den, magic, shift, scaled
++#define L64_TB_SHIFT		24
++#define L64_TB_SCALED		32
+ 
+ 	.text
+ 	.align 2
+@@ -469,9 +475,11 @@ LEXT(linux64_el0_run)
+ 	mrs		x10, VBAR_EL1
+ 	str		x10, [x15, #16]
+ 	str		x18, [x15, #24]
++	stp		x1, x0, [x15, #40]					// JOP off; the user state the next exception saves into
++	cbz		x1, 0f								// SCTLR_EL1 changes (and is put back) only with JOP off
+ 	mrs		x10, SCTLR_EL1
+ 	str		x10, [x15, #32]
+-	str		x1, [x15, #40]
++0:
+ 	adrp	x10, EXT(linux64_el0_vectors)@page
+ 	add		x10, x10, EXT(linux64_el0_vectors)@pageoff
+ 	msr		VBAR_EL1, x10
+@@ -521,8 +529,15 @@ LEXT(linux64_el0_run)
+ 	orr		x11, x11, #(1 << 13)
+ 	bic		x10, x10, x11
+ 	msr		SCTLR_EL1, x10
++	isb
++	b		2f
+ 1:
++	/* With SCTLR_EL1.EOS (every Linux host sets it, RES1 without FEAT_ExS) the eret is context synchronizing */
++	adrp	x10, _linux64_eret_cse@PAGE
++	ldr		w10, [x10, _linux64_eret_cse@PAGEOFF]
++	cbnz	w10, 2f
+ 	isb
++2:
+ 	add		x30, x0, SS64_X0
+ 	ldp		x2, x3, [x30, #16]
+ 	ldp		x4, x5, [x30, #32]
+@@ -541,6 +556,8 @@ LEXT(linux64_el0_run)
+ 	ldp		x0, x1, [x30, #0]
+ 	ldr		x30, [x30, #240]
+ 	eret
++	dsb		nsh
++	isb
+ 
+ 	.text
+ 	.align 11
+@@ -571,79 +588,164 @@ Llinux64_el0_bad:								// note it for the monitor (linux64_dbg[14] = ESR) and
+ 	b		.
+ 
+ Llinux64_el0_irq:								// as an exception, with ESR = ~0 (LINUX64_EL0_ESR_IRQ: no ESR has bits 63:32 set)
+-	sub		sp, sp, #LINUX64_EL0_FRAME
+-	stp		x0, x1, [sp, #0]
+-	mov		x1, #1
+-	b		Llinux64_el0_common
++	stp		x9, x10, [sp, #-16]!
++	mov		x9, #-1
++	b		Llinux64_el0_save
+ Llinux64_el0_entry:
+-	sub		sp, sp, #LINUX64_EL0_FRAME
+-	stp		x0, x1, [sp, #0]
+-	mov		x1, #0
+-Llinux64_el0_common:
+-	stp		x2, x3, [sp, #16]
+-	stp		x4, x5, [sp, #32]
+-	stp		x6, x7, [sp, #48]
+-	stp		x8, x9, [sp, #64]
+-	stp		x10, x11, [sp, #80]
+-	stp		x12, x13, [sp, #96]
+-	stp		x14, x15, [sp, #112]
+-	stp		x16, x17, [sp, #128]
+-	stp		x18, x19, [sp, #144]
+-	stp		x20, x21, [sp, #160]
+-	stp		x22, x23, [sp, #176]
+-	stp		x24, x25, [sp, #192]
+-	stp		x26, x27, [sp, #208]
+-	stp		x28, x29, [sp, #224]
+-	str		x30, [sp, #240]
++	stp		x9, x10, [sp, #-16]!					// sp = block - 16
++	mrs		x9, ESR_EL1
++	ubfx	x10, x9, #26, #6					// ESR_EC
++	cmp		x10, #0x15							// ESR_EC_SVC_64
++	b.ne	Llinux64_el0_save
++	cmn		w16, #3								// MACH_ARM_TRAP_ABSTIME (handle_svc compares the number as an int)
++	b.eq	Llinux64_el0_time
++	cmn		w16, #4								// MACH_ARM_TRAP_CONTTIME
++	b.ne	Llinux64_el0_save
++Llinux64_el0_time:
++	/*
++	 * mach_absolute_time / mach_continuous_time, as handle_mach_absolute_time_trap and handle_mach_continuous_time_trap
++	 * compute them (ml_get_timebase: the counter after an isb, scaled as timebase_from_counter does, plus this CPU's
++	 * cpu_base_timebase, read again around it; continuous: plus mach_absolutetime_asleep, read on both sides of a
++	 * barrier), into x0, every other register as it was: no kernel entry, no AST check, as the commpage read on
++	 * hardware. Off (linux64_el0_fast == 0) under linux64_trace and linux64_el0_perf, which count every trap; a scale
++	 * the reciprocal does not cover (linux64_tb.scaled > 1) takes the C path.
++	 */
++	adrp	x10, _linux64_el0_fast@PAGE
++	ldr		w10, [x10, _linux64_el0_fast@PAGEOFF]
++	cbz		w10, Llinux64_el0_save
++	adrp	x10, _linux64_tb@PAGE
++	add		x10, x10, _linux64_tb@PAGEOFF
++	ldr		w10, [x10, #L64_TB_SCALED]
++	cmp		w10, #1
++	b.hi	Llinux64_el0_save
++	stp		x11, x12, [sp, #-16]!
++	stp		x13, x14, [sp, #-16]!
++	stp		x15, x16, [sp, #-16]!				// sp = block - 64: the user's x16 at [sp, #8], the thread at [sp, #64]
++	ldr		x10, [sp, #64]
++	ldr		x10, [x10, ACT_CPUDATAP]
++	adrp	x13, _linux64_tb@PAGE
++	add		x13, x13, _linux64_tb@PAGEOFF
++1:
++	mov		x15, #0
++	ldr		w9, [sp, #8]
++	cmn		w9, #4
++	b.ne	2f
++	adrp	x15, _mach_absolutetime_asleep@PAGE
++	ldr		x15, [x15, _mach_absolutetime_asleep@PAGEOFF]
++2:
++	ldr		x11, [x10, CPU_BASE_TIMEBASE]
++	isb											// ml_get_hwclock: no counter read ahead of this point
++	mrs		x12, CNTVCT_EL0
++	ldr		x9, [x10, CPU_BASE_TIMEBASE]
++	cmp		x9, x11
++	b.ne	2b									// ml_get_timebase's retry
++	ldr		w9, [x13, #L64_TB_SCALED]
++	cbz		w9, 3f
++	// counter * num / den as q * num + r * num / den (q, r = counter / den, counter % den), each / den by reciprocal
++	ldr		x9, [x13, #L64_TB_MAGIC]
++	umulh	x14, x12, x9
++	sub		x9, x12, x14
++	add		x14, x14, x9, lsr #1
++	ldr		x9, [x13, #L64_TB_SHIFT]
++	lsr		x14, x14, x9						// q
++	ldr		x9, [x13, #8]						// den
++	msub	x12, x14, x9, x12					// r
++	ldr		x9, [x13, #0]						// num
++	mul		x14, x14, x9
++	mul		x12, x12, x9						// r * num < den * num < 2^64
++	ldr		x9, [x13, #L64_TB_MAGIC]
++	umulh	x16, x12, x9
++	sub		x9, x12, x16
++	add		x16, x16, x9, lsr #1
++	ldr		x9, [x13, #L64_TB_SHIFT]
++	lsr		x16, x16, x9
++	add		x12, x14, x16
++3:
++	add		x12, x12, x11						// mach_absolute_time()
++	ldr		w9, [sp, #8]
++	cmn		w9, #4
++	b.ne	4f
++	dmb		ish									// OSMemoryBarrier, as mach_continuous_time
++	adrp	x9, _mach_absolutetime_asleep@PAGE
++	ldr		x9, [x9, _mach_absolutetime_asleep@PAGEOFF]
++	cmp		x9, x15
++	b.ne	1b
++	add		x12, x12, x15
++4:
++	mov		x0, x12
++	ldp		x15, x16, [sp], #16
++	ldp		x13, x14, [sp], #16
++	ldp		x11, x12, [sp], #16
++	ldp		x9, x10, [sp], #16
++	eret
++	dsb		nsh
++	isb
++
++Llinux64_el0_save:								// x9 = ESR (~0: IRQ); the user's x9, x10 at [sp]; sp = block - 16
++	ldr		x10, [sp, #(16 + 48)]				// the thread's arm_context_t (linux64_el0_run)
++	stp		x0, x1, [x10, L64_SS_X(0)]
++	stp		x2, x3, [x10, L64_SS_X(2)]
++	stp		x4, x5, [x10, L64_SS_X(4)]
++	stp		x6, x7, [x10, L64_SS_X(6)]
++	str		x8, [x10, L64_SS_X(8)]
++	ldp		x0, x1, [sp], #16						// the user's x9, x10; sp = the block
++	stp		x0, x1, [x10, L64_SS_X(9)]
++	stp		x11, x12, [x10, L64_SS_X(11)]
++	stp		x13, x14, [x10, L64_SS_X(13)]
++	stp		x15, x16, [x10, L64_SS_X(15)]
++	stp		x17, x18, [x10, L64_SS_X(17)]
++	stp		x19, x20, [x10, L64_SS_X(19)]
++	stp		x21, x22, [x10, L64_SS_X(21)]
++	stp		x23, x24, [x10, L64_SS_X(23)]
++	stp		x25, x26, [x10, L64_SS_X(25)]
++	stp		x27, x28, [x10, L64_SS_X(27)]
++	stp		x29, x30, [x10, SS64_FP]				// fp, lr
+ 	mrs		x0, SP_EL0
+-	str		x0, [sp, #248]
+-	mrs		x0, ELR_EL1
+-	str		x0, [sp, #256]
++	mrs		x1, ELR_EL1
++	stp		x0, x1, [x10, SS64_SP]				// sp, pc
+ 	mrs		x0, SPSR_EL1
+-	str		x0, [sp, #264]
+-	mrs		x0, ESR_EL1
+-	cbz		x1, 1f
+-	mov		x0, #-1
++	bic		w0, w0, #0x3c0						// the user's own PSTATE: EL0 runs with FIQs masked while hosted
++	str		w0, [x10, SS64_CPSR]
++	mrs		x1, FAR_EL1
++	cmn		x9, #1
++	b.eq	1f									// an IRQ: no syndrome or fault address of the user's to keep
++	stp		x1, x9, [x10, SS64_FAR]				// far, esr
+ 1:
+-	str		x0, [sp, #272]
+-	mrs		x0, FAR_EL1
+-	str		x0, [sp, #280]
+-	add		x9, sp, #288						// the user's NEON/FP registers (linux64_el0_exception keeps them in uNeon)
+-	stp		q0, q1, [x9, #0]
+-	stp		q2, q3, [x9, #32]
+-	stp		q4, q5, [x9, #64]
+-	stp		q6, q7, [x9, #96]
+-	stp		q8, q9, [x9, #128]
+-	stp		q10, q11, [x9, #160]
+-	stp		q12, q13, [x9, #192]
+-	stp		q14, q15, [x9, #224]
+-	stp		q16, q17, [x9, #256]
+-	stp		q18, q19, [x9, #288]
+-	stp		q20, q21, [x9, #320]
+-	stp		q22, q23, [x9, #352]
+-	stp		q24, q25, [x9, #384]
+-	stp		q26, q27, [x9, #416]
+-	stp		q28, q29, [x9, #448]
+-	stp		q30, q31, [x9, #480]
+-	mrs		x10, FPSR
+-	str		w10, [x9, #512]
+-	mrs		x10, FPCR
+-	str		w10, [x9, #516]
+-	add		x9, sp, #LINUX64_EL0_FRAME			// linux64_el0_run's block
+-	ldr		x10, [x9, #0]
++	add		x2, x10, NS64_Q0						// the user's NEON/FP registers, into ns
++	stp		q0, q1, [x2, #0]
++	stp		q2, q3, [x2, #32]
++	stp		q4, q5, [x2, #64]
++	stp		q6, q7, [x2, #96]
++	stp		q8, q9, [x2, #128]
++	stp		q10, q11, [x2, #160]
++	stp		q12, q13, [x2, #192]
++	stp		q14, q15, [x2, #224]
++	stp		q16, q17, [x2, #256]
++	stp		q18, q19, [x2, #288]
++	stp		q20, q21, [x2, #320]
++	stp		q22, q23, [x2, #352]
++	stp		q24, q25, [x2, #384]
++	stp		q26, q27, [x2, #416]
++	stp		q28, q29, [x2, #448]
++	stp		q30, q31, [x2, #480]
++	mrs		x3, FPSR
++	str		w3, [x2, #512]
++	mrs		x3, FPCR
++	str		w3, [x2, #516]
++	mov		x0, x9								// linux64_el0_exception(esr, far)
++	ldr		x10, [sp, #0]
+ 	msr		TPIDRRO_EL0, x10					// XNU's thread pointer again
+-	ldr		x10, [x9, #8]
++	ldr		x10, [sp, #8]
+ 	msr		SP_EL0, x10
+-	ldr		x10, [x9, #16]
++	ldr		x10, [sp, #16]
+ 	msr		VBAR_EL1, x10
+-	ldr		x18, [x9, #24]						// the host's x18 again (user code owns x18 at EL0)
+-	ldr		x10, [x9, #40]						// nonzero only when JOP was disabled for arm64
++	ldr		x18, [sp, #24]						// the host's x18 again (user code owns x18 at EL0)
++	ldr		x10, [sp, #40]						// nonzero only when JOP was disabled for arm64
+ 	cbz		x10, 2f
+-	ldr		x10, [x9, #32]						// SCTLR_EL1 as the kernels expect it (the keys back on)
++	ldr		x10, [sp, #32]						// SCTLR_EL1 as the kernels expect it (the keys back on)
+ 	msr		SCTLR_EL1, x10
+ 	isb
+ 2:
+-	mov		x0, sp
+ 	mov		x29, xzr
+ 	bl		EXT(linux64_el0_exception)
+ 	b		.
+diff --git a/osfmk/arm64/genassym.c b/osfmk/arm64/genassym.c
+index e80e5f7..e6d0e33 100644
+--- a/osfmk/arm64/genassym.c
++++ b/osfmk/arm64/genassym.c
+@@ -330,6 +330,7 @@ main(int     argc,
+ #endif
+ 	DECLARE("CPU_NUMBER_GS", offsetof(cpu_data_t, cpu_number));
+ 	DECLARE("CPU_PENDING_AST", offsetof(cpu_data_t, cpu_pending_ast));
++	DECLARE("CPU_BASE_TIMEBASE", offsetof(cpu_data_t, cpu_base_timebase));	/* LINUX64: cswitch.s time traps */
+ 	DECLARE("CPU_INT_STATE", offsetof(cpu_data_t, cpu_int_state));
+ 	DECLARE("CPU_USER_DEBUG", offsetof(cpu_data_t, cpu_user_debug));
+ 	DECLARE("CPU_STAT_IRQ", offsetof(cpu_data_t, cpu_stat.irq_ex_cnt));
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index b66afca..66fedde 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -2509,6 +2509,45 @@ ml_interrupt_prewarm(__unused uint64_t deadline)
+  */
+ uint32_t ml_timebase_scale_num = 1, ml_timebase_scale_den = 1;
+ 
++/*
++ * LINUX64 (xnulinux): the same scale with the divisions by den as multiplications by its reciprocal (Granlund and
++ * Montgomery: a 65-bit multiplier, exact for every 64-bit dividend), for timebase_from_counter and for the EL0 time
++ * traps answered in cswitch.s. scaled: 0 not scaled, 1 by reciprocal, 2 by division (den 1: no reciprocal needed or
++ * possible). ml_timebase_scale_update() after every change of ml_timebase_scale_num/den (pe_identify_machine.c).
++ */
++struct linux64_tb_scale linux64_tb = { .num = 1, .den = 1, .magic = 0, .shift = 0, .scaled = 0 };
++_Static_assert(__builtin_offsetof(struct linux64_tb_scale, magic) == 16 && __builtin_offsetof(struct linux64_tb_scale, shift) == 24 &&
++    __builtin_offsetof(struct linux64_tb_scale, scaled) == 32, "cswitch.s reads linux64_tb at these offsets");
++
++void ml_timebase_scale_update(void);
++void
++ml_timebase_scale_update(void)
++{
++	const uint64_t num = ml_timebase_scale_num, den = ml_timebase_scale_den;
++
++	linux64_tb.scaled = 0;
++	linux64_tb.num = num;
++	linux64_tb.den = den;
++	if (num == den) {
++		return;
++	}
++	if (den < 2) {
++		linux64_tb.scaled = 2;
++		return;
++	}
++	const unsigned l = 64 - (unsigned)__builtin_clzll(den - 1);	/* ceil(log2(den)): 1..32 */
++	linux64_tb.magic = (uint64_t)((((unsigned __int128)((1ULL << l) - den)) << 64) / den) + 1;
++	linux64_tb.shift = l - 1;
++	linux64_tb.scaled = 1;
++}
++
++static inline uint64_t
++linux64_tb_div(uint64_t n)	/* n / linux64_tb.den */
++{
++	const uint64_t t = (uint64_t)(((unsigned __int128)n * linux64_tb.magic) >> 64);
++	return (t + ((n - t) >> 1)) >> linux64_tb.shift;
++}
++
+ static inline bool
+ timebase_scaled(void)
+ {
+@@ -2523,6 +2562,10 @@ timebase_from_counter(uint64_t counter)
+ 	if (__probable(num == den)) {
+ 		return counter;
+ 	}
++	if (__probable(linux64_tb.scaled == 1)) {
++		const uint64_t q = linux64_tb_div(counter);
++		return q * linux64_tb.num + linux64_tb_div((counter - q * linux64_tb.den) * linux64_tb.num);
++	}
+ 	return counter / den * num + counter % den * num / den;
+ }
+ 
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index a1cff56..b6225da 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -3718,9 +3718,10 @@ linux64_kernel_fault_recover(uint64_t pc, uint64_t far, uint64_t esr)
+ }
+ 
+ /*
+- * LINUX64 (xnulinux): the first return of a new user thread (thread_bootstrap_return) while hosted. The pending ASTs
+- * run as on the way to user space (for the first BSD thread: bsdinit_task, which execs launchd), and the thread enters
+- * user space through linux64_el0_run (the host is told where user space starts the first time).
++ * LINUX64 (xnulinux): the first return of a new user thread (thread_bootstrap_return), and every return to user space
++ * (arm64_thread_exception_return), while hosted. Pending ASTs run as on locore's way to user space (for the first BSD
++ * thread: bsdinit_task, which execs launchd), and the thread enters user space through linux64_el0_run (the host is
++ * told where user space starts the first time).
+  */
+ void linux64_thread_bootstrap_return(void) __attribute__((noreturn));
+ /* boot-arg linux64_trace=1 logs every EL0 exception, and system calls with their paths and results */
+@@ -3760,6 +3761,14 @@ linux64_el0_perf_on(void)
+ 	return linux64_el0_perf_level;
+ }
+ 
++/*
++ * cswitch.s: 1 when the EL0 vector answers mach_absolute_time and mach_continuous_time itself; 0 under linux64_trace
++ * and linux64_el0_perf (which see every trap) or boot-arg linux64_el0_fast=0. Set before user space first runs.
++ */
++uint32_t linux64_el0_fast;
++/* cswitch.s: SCTLR_EL1.EOS, an exception return is context synchronizing: linux64_el0_run needs no isb before its eret */
++uint32_t linux64_eret_cse;
++
+ void
+ linux64_thread_bootstrap_return(void)
+ {
+@@ -3767,15 +3776,33 @@ linux64_thread_bootstrap_return(void)
+ 
+ 	static int reported;
+ 
+-	(void)ml_set_interrupts_enabled(FALSE);
+-	ast_taken_user();
++	/*
++	 * As locore's check_user_asts: reset IO tier override on every pass, and run ast_taken_user only while this CPU has
++	 * ASTs pending (a handler may block, come back on another CPU or leave new ones), interrupts off each time.
++	 */
++	for (;;) {
++		thread->iotier_override = THROTTLE_LEVEL_NONE;
++		(void)ml_set_interrupts_enabled(FALSE);
++		if (getCpuDatap()->cpu_pending_ast == AST_NONE) {
++			break;
++		}
++		ast_taken_user();
++	}
+ 	if (linux64_svc_thread == thread && linux64_tracing()) {	/* what the system call returned (C set: x0 is errno) */
+ 		linux64_svc_thread = NULL;
+ 		extern int proc_selfpid(void);
+ 		kprintf("linux64: [%d] svc %lld -> x0 0x%llx x1 0x%llx%s\n", proc_selfpid(), linux64_svc_num, get_saved_state_reg(thread->machine.upcb, 0),
+ 		    get_saved_state_reg(thread->machine.upcb, 1), (get_saved_state_cpsr(thread->machine.upcb) & PSR64_C) ? " (error)" : "");
+ 	}
+-	if (reported++ == 0) {
++	if (__improbable(!reported)) {
++		int fast = 1;
++		reported = 1;
++		extern uint32_t timebase_validation;
++		if (!PE_parse_boot_argn("linux64_el0_fast", &fast, sizeof(fast))) {
++			fast = 1;
++		}
++		linux64_el0_fast = (fast && !linux64_tracing() && !linux64_el0_perf_on() && !timebase_validation) ? 1 : 0;
++		linux64_eret_cse = (__builtin_arm_rsr64("SCTLR_EL1") & (1ULL << 11)) ? 1 : 0;
+ 		linux64_call2(LINUX64_CALL_USER_ENTER, get_saved_state_pc(thread->machine.upcb), 0);
+ 	}
+ 	/*
+@@ -3794,106 +3821,73 @@ linux64_thread_bootstrap_return(void)
+ 			linux64_el0_t0[slot] = 0;
+ 		}
+ 	}
++	if (__improbable((char *)thread->machine.uNeon != (char *)thread->machine.upcb + sizeof(arm_saved_state_t))) {
++		panic("linux64: thread %p upcb/uNeon detached", thread);
++	}
+ 	linux64_el0_run(thread->machine.upcb, (thread->machine.arm_machine_flags & ARM_MACHINE_THREAD_DISABLE_USER_JOP) != 0);
+ }
+ 
+-/* LINUX64: the registers linux64_el0_vectors saved for an exception taken at EL0 (cswitch.s) */
+-struct linux64_el0_frame {
+-	uint64_t x[31];
+-	uint64_t sp, pc, cpsr, esr, far;
+-	uint64_t neon[64];			/* q0..q31 */
+-	uint32_t fpsr, fpcr;
+-	uint64_t pad;
+-};
+-_Static_assert(__builtin_offsetof(struct linux64_el0_frame, neon) == 288, "linux64_el0_frame layout");
+-_Static_assert(sizeof(struct linux64_el0_frame) == 36 * 8 + 528, "linux64_el0_frame size");
+-
+-void linux64_el0_exception(struct linux64_el0_frame *f) __attribute__((noreturn));
++/*
++ * LINUX64: an exception taken at EL0 (cswitch.s). The vector saved the user state straight into the thread's
++ * arm_context_t: x0..x30, sp, pc, cpsr (DAIF clear: EL0 runs with IRQ/FIQ masked while hosted, and XNU must see the
++ * user's own PSTATE, or its abort path takes the user fault for one from a non-interruptible context), and for a
++ * synchronous exception esr and far; ns: q0..q31, fpsr, fpcr. esr is ~0 for a host IRQ.
++ */
++void linux64_el0_exception(uint64_t esr, uint64_t far) __attribute__((noreturn));
+ void
+-linux64_el0_exception(struct linux64_el0_frame *f)
++linux64_el0_exception(uint64_t esr, uint64_t far)
+ {
+ 	thread_t thread = current_thread();
+ 	arm_saved_state_t *ss = thread->machine.upcb;
++	arm_saved_state64_t *s64 = saved_state64(ss);
+ 
+-#if PRECISE_USER_KERNEL_TIME
+-	recount_leave_user();		/* interrupts are still off here, as on locore's exception entry */
+-#endif
+-	{
+-		unsigned int slot = (unsigned int)cpu_number() & (LINUX64_EL0_CPUS - 1);
+-		uint64_t seq = ++linux64_el0_exc_pcpu[slot].exc;
+-		if (__improbable((seq & 255) == 0)) {
+-			__atomic_fetch_add(&linux64_dbg[LINUX64_CTR_EL0_EXC], 256, __ATOMIC_RELAXED);
+-			linux64_dbg[LINUX64_CTR_EL0_ESR] = f->esr;
+-			linux64_dbg[LINUX64_CTR_EL0_FAR] = f->far;
+-			linux64_dbg[LINUX64_CTR_EL0_PC] = f->pc;
+-		}
+-		if (__improbable(linux64_el0_perf_on())) {
+-			unsigned int ec = (unsigned int)ESR_EC(f->esr);
+-			unsigned int cls = f->esr == ~0ULL ? 3 : ec == ESR_EC_SVC_64 ? 0 : ec == ESR_EC_DABORT_EL0 ? 1 : ec == ESR_EC_IABORT_EL0 ? 2 : 4;
+-			linux64_el0_stat[slot][0][cls]++;
+-			linux64_el0_cls[slot] = (uint8_t)cls;
+-			linux64_el0_t0[slot] = __builtin_arm_rsr64("CNTVCT_EL0");
+-		}
+-	}
+-	if (linux64_tracing()) kprintf("linux64: EL0 exception esr 0x%llx far 0x%llx pc 0x%llx x16 %lld ttbr0 0x%llx ttep 0x%llx\n", f->esr, f->far, f->pc, f->x[16],
+-	    __builtin_arm_rsr64("TTBR0_EL1"), (uint64_t)thread->map->pmap->ttep);
+-	/*
+-	 * The whole user state at once, signed once as locore's exception entry does (HAS_APPLE_PAC): the per-field setters
+-	 * each check the old signature and sign again, five times per exception. EL0 runs with IRQ/FIQ masked while hosted
+-	 * (no XNU interrupts at EL0 yet); XNU must see the user's own PSTATE, or its abort path takes the user fault for
+-	 * one from a non-interruptible context.
+-	 */
+-	{
+-		arm_saved_state64_t *s64 = saved_state64(ss);
+-		uint32_t cpsr = (uint32_t)f->cpsr & ~(uint32_t)0x3c0;
+-		for (unsigned i = 0; i < 29; i++) {
+-			if (i != 16 && i != 17) {
+-				s64->x[i] = f->x[i];
+-			}
+-		}
+-		s64->fp = f->x[29];
+-		s64->sp = f->sp;
+ #if HAS_APPLE_PAC
++	/* signed once, as locore's exception entry does, before anything reads it through the accessors */
++	{
+ 		uint64_t intr = ml_pac_safe_interrupts_disable();
+ 		asm volatile (
+ 			"mov	x9, lr"				"\n"
+ 			"mov	x0, %[ss]"			"\n"
+ 			"mrs	x10, SPSel"			"\n"
+ 			"msr	SPSel, #1"			"\n"
+-			"mov	x1, %[pc]"			"\n"
+-			"mov	w2, %w[cpsr]"			"\n"
+-			"mov	x3, %[lr]"			"\n"
+-			"mov	x4, %[x16]"			"\n"
+-			"mov	x5, %[x17]"			"\n"
+-			"str	x1, [x0, %[SS64_PC]]"		"\n"
+-			"str	w2, [x0, %[SS64_CPSR]]"		"\n"
+-			"str	x3, [x0, %[SS64_LR]]"		"\n"
+-			"stp	x4, x5, [x0, %[SS64_X16]]"	"\n"
++			"ldr	x1, [x0, %[SS64_PC]]"		"\n"
++			"ldr	w2, [x0, %[SS64_CPSR]]"		"\n"
++			"ldr	x3, [x0, %[SS64_LR]]"		"\n"
++			"ldp	x4, x5, [x0, %[SS64_X16]]"	"\n"
+ 			"bl	_ml_sign_thread_state"		"\n"
+ 			"msr	SPSel, x10"			"\n"
+ 			"mov	lr, x9"				"\n"
+ 			:
+-			: [ss] "r"(ss), [pc] "r"(f->pc), [cpsr] "r"(cpsr), [lr] "r"(f->x[30]), [x16] "r"(f->x[16]), [x17] "r"(f->x[17]),
+-			  [SS64_X16] "i"(ss64_offsetof(x[16])), [SS64_PC] "i"(ss64_offsetof(pc)),
++			: [ss] "r"(ss), [SS64_X16] "i"(ss64_offsetof(x[16])), [SS64_PC] "i"(ss64_offsetof(pc)),
+ 			  [SS64_CPSR] "i"(ss64_offsetof(cpsr)), [SS64_LR] "i"(ss64_offsetof(lr))
+ 			: "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x16", "x17", "memory"
+ 		);
+ 		ml_pac_safe_interrupts_restore(intr);
+-#else
+-		s64->x[16] = f->x[16];
+-		s64->x[17] = f->x[17];
+-		s64->lr = f->x[30];
+-		s64->pc = f->pc;
+-		s64->cpsr = cpsr;
+-#endif
+ 	}
++#endif /* HAS_APPLE_PAC */
++#if PRECISE_USER_KERNEL_TIME
++	recount_leave_user();		/* interrupts are still off here, as on locore's exception entry */
++#endif
+ 	{
+-		arm_neon_saved_state_t *ns = thread->machine.uNeon;
+-		memcpy(&ns->ns_64.v.q[0], f->neon, sizeof(f->neon));
+-		ns->ns_64.fpsr = f->fpsr;
+-		ns->ns_64.fpcr = f->fpcr;
++		unsigned int slot = (unsigned int)cpu_number() & (LINUX64_EL0_CPUS - 1);
++		uint64_t seq = ++linux64_el0_exc_pcpu[slot].exc;
++		if (__improbable((seq & 255) == 0)) {
++			__atomic_fetch_add(&linux64_dbg[LINUX64_CTR_EL0_EXC], 256, __ATOMIC_RELAXED);
++			linux64_dbg[LINUX64_CTR_EL0_ESR] = esr;
++			linux64_dbg[LINUX64_CTR_EL0_FAR] = far;
++			linux64_dbg[LINUX64_CTR_EL0_PC] = s64->pc;
++		}
++		if (__improbable(linux64_el0_perf_on())) {
++			unsigned int ec = (unsigned int)ESR_EC(esr);
++			unsigned int cls = esr == ~0ULL ? 3 : ec == ESR_EC_SVC_64 ? 0 : ec == ESR_EC_DABORT_EL0 ? 1 : ec == ESR_EC_IABORT_EL0 ? 2 : 4;
++			linux64_el0_stat[slot][0][cls]++;
++			linux64_el0_cls[slot] = (uint8_t)cls;
++			linux64_el0_t0[slot] = __builtin_arm_rsr64("CNTVCT_EL0");
++		}
+ 	}
+-	if (f->esr == ~0ULL) {
++	if (linux64_tracing()) kprintf("linux64: EL0 exception esr 0x%llx far 0x%llx pc 0x%llx x16 %lld ttbr0 0x%llx ttep 0x%llx\n", esr, far, s64->pc, s64->x[16],
++	    __builtin_arm_rsr64("TTBR0_EL1"), (uint64_t)thread->map->pmap->ttep);
++	if (esr == ~0ULL) {
+ 		/*
+ 		 * A host IRQ arrived while user code ran (EL0 runs with IRQs unmasked). Let Linux take it and run what it
+ 		 * must (its tick, RCU, other tasks), then deliver XNU's timer "interrupt" if it is due, as sleh_irq
+@@ -3909,34 +3903,34 @@ linux64_el0_exception(struct linux64_el0_frame *f)
+ 			rtclock_intr(TRUE);
+ 			cdp->cpu_int_state = NULL;
+ 		}
+-		if (os_atomic_load(&linux64_ipi_pending[linux64_cpu_slot()], relaxed)) {	/* another CPU's IPI, as sleh_fiq takes it */
++		if (os_atomic_load(&linux64_pcpu_self()->ipi_pending, relaxed)) {	/* another CPU's IPI, as sleh_fiq takes it */
+ 			cdp->cpu_int_state = ss;
+ 			linux64_ipi_take();
+ 			cdp->cpu_int_state = NULL;
+ 		}
+ 		thread_exception_return();
+ 	}
+-	if (ESR_EC(f->esr) == ESR_EC_SVC_64 && linux64_tracing()) {
+-		long long num = (long long)f->x[16];
++	if (ESR_EC(esr) == ESR_EC_SVC_64 && linux64_tracing()) {
++		long long num = (long long)s64->x[16];
+ 		linux64_svc_thread = thread;
+ 		linux64_svc_num = num;
+-		if (num == 202 && f->x[1] > 0 && f->x[1] <= 8) {	/* sysctl: the MIB and this thread's kernel stack */
++		if (num == 202 && s64->x[1] > 0 && s64->x[1] <= 8) {	/* sysctl: the MIB and this thread's kernel stack */
+ 			int mib[8] = {0};
+-			if (copyin((user_addr_t)f->x[0], mib, f->x[1] * sizeof(int)) == 0) {
+-				kprintf("linux64: svc 202 mib %d.%d.%d.%d (len %llu) kstack 0x%llx\n", mib[0], mib[1], mib[2], mib[3], f->x[1],
++			if (copyin((user_addr_t)s64->x[0], mib, s64->x[1] * sizeof(int)) == 0) {
++				kprintf("linux64: svc 202 mib %d.%d.%d.%d (len %llu) kstack 0x%llx\n", mib[0], mib[1], mib[2], mib[3], s64->x[1],
+ 				    (uint64_t)thread->kernel_stack);
+ 			}
+ 		}
+ 		if (num == 59 || num == 244 || num == 5 || num == 398 || num == 463 || num == 33 || num == 338 || num == 340 || num == 466 || num == 469) {
+ 			char path[128];
+ 			size_t len = 0;
+-			uint64_t ua = (num == 463 || num == 466 || num == 469 || num == 244) ? f->x[1] : f->x[0];
++			uint64_t ua = (num == 463 || num == 466 || num == 469 || num == 244) ? s64->x[1] : s64->x[0];
+ 			if (copyinstr((user_addr_t)ua, path, sizeof(path), &len) == 0) {
+ 				extern int proc_selfpid(void);
+ 				kprintf("linux64: [%d] svc %lld path \"%s\"\n", proc_selfpid(), num, path);
+ 			}
+ 		}
+ 	}
+-	sleh_synchronous(thread->machine.contextData, f->esr, (vm_offset_t)f->far, false);
++	sleh_synchronous(thread->machine.contextData, esr, (vm_offset_t)far, false);
+ 	thread_exception_return();
+ }
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index af01ff3..b77c79f 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -3011,7 +3011,9 @@ thread_invoke(
+ 
+ 	thread_continue_t       continuation = self->continuation;
+ 	void                    *parameter   = self->parameter;
+-	linux64_count(LINUX64_CTR_SWITCHES); linux64_dbg[LINUX64_CTR_THREAD] = (unsigned long)thread;	/* LINUX64: for the host's monitor */
++	if (linux64_count(LINUX64_CTR_SWITCHES)) {	/* LINUX64: for the host's monitor (per CPU, added every 64) */
++		linux64_dbg[LINUX64_CTR_THREAD] = (unsigned long)thread;
++	}
+ 
+ 	struct recount_snap snap = { 0 };
+ 	recount_snapshot(&snap);
+diff --git a/pexpert/arm/pe_identify_machine.c b/pexpert/arm/pe_identify_machine.c
+index 0bf0f33..21112b8 100644
+--- a/pexpert/arm/pe_identify_machine.c
++++ b/pexpert/arm/pe_identify_machine.c
+@@ -61,6 +61,10 @@ droidvm_virtual_timebase(void)
+ 	}
+ 	ml_timebase_scale_num = (uint32_t)(target / a);
+ 	ml_timebase_scale_den = (uint32_t)(hardware / a);
++	{
++		extern void ml_timebase_scale_update(void);	/* LINUX64: the scale's reciprocal (machine_routines.c) */
++		ml_timebase_scale_update();
++	}
+ 	gPEClockFrequencyInfo.timebase_frequency_hz = target;
+ }
+ 

@@ -1,0 +1,111 @@
+LINUX64 (xnulinux): an XNU for a Linux host with a 16 KB translation granule (XNU_LINUX64_16K=1, scripts/vm-xnu-rebuild.sh XNU_16K=1).
+XNU's tables are the hardware's: 16 KB pages, 3-level 47-bit user and kernel pmaps (T0SZ = T1SZ = 17, no L0 shim, no subpage L1),
+and the kernel says which granule it was built for (linux64_granule_shift) so xnu.ko refuses the wrong host.
+
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -235,6 +235,8 @@
+ unsigned int linux64_vint[LINUX64_CPU_SLOTS];
+ unsigned int linux64_ipi_pending[LINUX64_CPU_SLOTS];
+ unsigned long linux64_dbg[LINUX64_NCOUNTERS];
++/* LINUX64: the translation granule this kernel was built for (12: 4 KB, 14: 16 KB); xnu.ko refuses a host of another one */
++const unsigned int linux64_granule_shift = ARM_PGSHIFT;
+ 
+ static void
+ arm_slide_rebase_and_sign_image(void)
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -3135,8 +3135,8 @@
+ 	}
+ 
+ 	p->ttep = ml_static_vtop((vm_offset_t)p->tte);
+-	if (pt_attr_root_level(pmap_get_pt_attr(p)) == PMAP_TT_L0_LEVEL) {
+-		/* LINUX64: the root already is the level-0 table TTBR0 walks from */
++	if (pt_attr_root_level(pmap_get_pt_attr(p)) == PMAP_TT_L0_LEVEL || T0SZ_HW == T0SZ_BOOT) {
++		/* LINUX64: the root already is the table TTBR0 walks from (a level-0 root, or a 16 KB build at its own width: no shim) */
+ 		p->hw_tte = p->tte;
+ 		p->hw_ttep = p->ttep;
+ 		for (i = 0; i < tte_index_max; i++) {
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -437,7 +437,9 @@
+ 3:	add	$4, $4, PGBYTES
+ 	/* Refuse before a new table can overwrite adjacent kernel globals. */
+ 	add $6, x25, #(BOOTSTRAP_TABLE_BYTES >> 12), lsl #12
++#if !__ARM_16K_PG__
+ 	sub $6, $6, PGBYTES							// the last page of the pool is the TTBR0 level-0 table
++#endif
+ 	cmp $4, $6
+ 	b.hs Lbootstrap_tables_exhausted
+ 
+@@ -633,9 +635,10 @@
+ 	// the early debugger rather than corrupting memory or forging a map.
+ 	b Lbootstrap_tables_exhausted
+ Lbootstrap_tables_ready:
++#if !__ARM_16K_PG__
+ 	/*
+ 	 * TTBR0 walks from level 0 (T0SZ_HW): a table whose only entry points at the V=P L1 table. It is the last page of the
+-	 * pool, which the invalidation above has cleared.
++	 * pool, which the invalidation above has cleared. (16 KB: T0SZ_HW is T0SZ_BOOT, the V=P L1 table is the root.)
+ 	 */
+ 	add		x0, x25, #(BOOTSTRAP_TABLE_BYTES >> 12), lsl #12
+ 	sub		x0, x0, PGBYTES
+@@ -643,6 +646,7 @@
+ 	and		x2, x25, #(ARM_TTE_TABLE_MASK)
+ 	orr		x1, x1, x2
+ 	str		x1, [x0]
++#endif
+ 
+ 	/* Ensure TTEs are visible */
+ 	dsb		ish
+@@ -688,9 +692,13 @@
+ 	 * arm_vm_init.c.
+ 	 */
+ #endif
++#if !__ARM_16K_PG__
+ 	add		x0, x25, #(BOOTSTRAP_TABLE_BYTES >> 12), lsl #12
+ 	sub		x0, x0, PGBYTES						// the TTBR0 level-0 table, last page of the pool
+ 	and		x0, x0, #(TTBR_BADDR_MASK)
++#else
++	and		x0, x25, #(TTBR_BADDR_MASK)
++#endif
+ 	mov		x19, lr
+ 	bl		EXT(set_mmu_ttb)
+ 	mov		lr, x19
+diff --git a/osfmk/mach/arm/vm_param.h b/osfmk/mach/arm/vm_param.h
+--- a/osfmk/mach/arm/vm_param.h
++++ b/osfmk/mach/arm/vm_param.h
+@@ -149,8 +149,8 @@
+ #undef MACH_VM_MAX_ADDRESS_RAW
+ #define MACH_VM_MAX_ADDRESS_RAW 0x00007FFFFE000000ULL
+ #endif /* defined(XNU_PLATFORM_iPhoneOS) && EXTENDED_USER_VA_SUPPORT */
+-#if !__ARM_16K_PG__ && !defined(XNU_PLATFORM_MacOSX)
+-/* LINUX64 (xnulinux): 4 KiB user pmaps span 47 bits (pmap_pt_attr_4k_user), the macOS layout its userland expects */
++#if !defined(XNU_PLATFORM_MacOSX)
++/* LINUX64 (xnulinux): user pmaps span 47 bits (4 KiB: pmap_pt_attr_4k_user; 16 KiB: T0SZ 17), the macOS layout its userland expects */
+ #undef MACH_VM_MAX_ADDRESS_RAW
+ #define MACH_VM_MAX_ADDRESS_RAW 0x00007FFFFE000000ULL
+ #endif
+diff --git a/pexpert/pexpert/arm64/BCM2837.h b/pexpert/pexpert/arm64/BCM2837.h
+--- a/pexpert/pexpert/arm64/BCM2837.h
++++ b/pexpert/pexpert/arm64/BCM2837.h
+@@ -22,7 +22,16 @@
+ #define __ARM_VFP__               4
+ #define __ARM_COHERENT_CACHE__    1
+ #define __ARM_DEBUG__             7
++#if XNU_LINUX64_16K
++/*
++ * LINUX64 (xnulinux): hosted on a Linux with a 16 KB translation granule (CONFIG_ARM64_16K_PAGES): XNU's own tables are the
++ * ones the hardware walks, so its pages are 16 KB too. User pmaps and the kernel pmap are 3-level from a full-page L1 root
++ * (T0SZ = T1SZ = 17, 47 bits: no subpage L1), the geometry TTBR0 runs with and the one Linux's L1 (pud) table has.
++ */
++#define __ARM_16K_PG__            1
++#else
+ #define __ARM64_PMAP_SUBPAGE_L1__ 1
++#endif
+ 
+ /* Explicit native ARMv8.1+ bring-up; the original A53 target has no PAN. */
+ #if defined(XNU_NATIVE_PAN) && XNU_NATIVE_PAN

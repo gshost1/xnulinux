@@ -45,13 +45,61 @@ linux64_cpu_slot(void)
 	return LINUX64_CPU_SLOT(mpidr);
 }
 
-/* Each CPU's interrupt-enable state: hardware interrupts stay masked while XNU runs; this flag is the virtual one */
-extern unsigned int linux64_vint[LINUX64_CPU_SLOTS];
-#define LINUX64_VINT linux64_vint[linux64_cpu_slot()]
-/* Each CPU's pending inter-processor interrupt (set by the sender, taken where XNU's interrupts are enabled again) */
-extern unsigned int linux64_ipi_pending[LINUX64_CPU_SLOTS];
+/*
+ * Each CPU's state, one 128-byte line per CPU (no false sharing between CPUs: Apple's line, and the pair of 64-byte
+ * lines a prefetcher fetches together), linux64_pcpu[linux64_pcpu_index[slot]]: line 0 is the boot CPU's (and that of
+ * every slot no CPU has), cpu_start gives each other CPU its line before the host starts it (linux64_pcpu_assign).
+ * A small table and few lines: the kernel's __DATA has no room for 256 lines.
+ *   vint        XNU's interrupt-enable state: hardware interrupts stay masked while XNU runs; this flag is the virtual one
+ *   ipi_pending another CPU's inter-processor interrupt (set by the sender, taken where XNU's interrupts are enabled
+ *               again); the host's IDLE call watches this word (its a2)
+ *   pv_kicked   a ticket-lock waiter's kick (arm64_hypercall.c), the IDLE word of that wait
+ *   polling     cpu_idle polls ipi_pending: a sender needs no host IPI (machine_routines_common.c, arm64/cpu.c)
+ *   last_kyield, relax_start, last_relax: counter ticks of the kernel's interrupt windows and spin-waits
+ *   dbg         this CPU's share of the hot linux64_dbg counters (below 8), added to them every 64
+ */
+struct linux64_pcpu {
+	unsigned int vint;
+	unsigned int ipi_pending;
+	unsigned int pv_kicked;
+	unsigned int polling;
+	unsigned long long last_kyield;
+	unsigned long long relax_start;
+	unsigned long long last_relax;
+	unsigned long dbg[8];
+} __attribute__((aligned(128)));
+#define LINUX64_PCPU_LINES 32
+extern unsigned char linux64_pcpu_index[LINUX64_CPU_SLOTS];
+extern struct linux64_pcpu linux64_pcpu[LINUX64_PCPU_LINES];
+static inline struct linux64_pcpu *
+linux64_pcpu_of_slot(unsigned slot)
+{
+	return &linux64_pcpu[linux64_pcpu_index[slot & (LINUX64_CPU_SLOTS - 1)]];
+}
+static inline struct linux64_pcpu *
+linux64_pcpu_self(void)
+{
+	return linux64_pcpu_of_slot(linux64_cpu_slot());
+}
+#define LINUX64_VINT (linux64_pcpu_self()->vint)
+#define LINUX64_IPI_PENDING(slot) (linux64_pcpu_of_slot(slot)->ipi_pending)
+/* osfmk/arm/arm_init.c: a line for the CPU of this MPIDR (cpu_start, before the host starts it) */
+void linux64_pcpu_assign(unsigned long mpidr);
 /* enum linux64_counter */
 extern unsigned long linux64_dbg[LINUX64_NCOUNTERS];
+
+/*
+ * The timebase's scale (droidvm-timebase-hz) for division-free conversion: osfmk/arm64/machine_routines.c, and the EL0
+ * time traps cswitch.s answers (which read it at these offsets). scaled: 0 none, 1 by reciprocal, 2 by division.
+ */
+struct linux64_tb_scale {
+	unsigned long long num;		/* 0 */
+	unsigned long long den;		/* 8 */
+	unsigned long long magic;	/* 16 */
+	unsigned long long shift;	/* 24 */
+	unsigned int scaled;		/* 32 */
+};
+extern struct linux64_tb_scale linux64_tb;
 
 /* A call into the host (enum linux64_call). The host's answer: 0 to go on. */
 static inline unsigned long
@@ -100,10 +148,24 @@ linux64_random_uniform(__UINT64_TYPE__ bound)
 	return v % bound;
 }
 
-static inline void
+/*
+ * A monitor counter. The hot ones (below 8: idle, switches, rtclock) count per CPU and reach linux64_dbg every 64, so
+ * CPUs do not take turns at one cache line on every context switch. True when this call added to linux64_dbg.
+ */
+static inline int
 linux64_count(enum linux64_counter c)
 {
+	if ((unsigned)c < 8) {
+		struct linux64_pcpu *pc = linux64_pcpu_self();
+		if (__builtin_expect(++pc->dbg[c] >= 64, 0)) {
+			__atomic_fetch_add(&linux64_dbg[c], pc->dbg[c], __ATOMIC_RELAXED);
+			pc->dbg[c] = 0;
+			return 1;
+		}
+		return 0;
+	}
 	linux64_dbg[c]++;
+	return 1;
 }
 
 /* osfmk/arm/arm_init.c */

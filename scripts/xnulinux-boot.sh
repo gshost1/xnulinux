@@ -14,7 +14,10 @@
 # environment:
 #   DISK (/var/tmp/mac.img)  RAM_MB (7900)  BOOTARGS  CONSOLE_IN (/var/tmp/console-in)  INPUT_IN (/var/tmp/xnu-input)
 #   FB_DUMP (/var/tmp/xnu-fb.raw)  KEYSTORE (/var/tmp/xnu-keystore.bin)  TRUSTCACHE (xnu/trustcache-mac.bin)
-#   IMAGE (xnu/kc.bin: the kernel collection under /lib/firmware)  GPU (auto|off)  CPUS (1: the hosted system's CPUs)  XNU_ARGS (more xnu.ko parameters)
+#   IMAGE (the kernel collection under /lib/firmware: xnu/kc.bin on a 4 KB-page host, xnu/kc16k.bin on a 16 KB one)
+#   GPU (auto|off)  CPUS (1: the hosted system's CPUs)  XNU_ARGS (more xnu.ko parameters)
+#   CARVE (fki's carve-out when fki is not loaded yet: carve_base=0x200000000 carve_mb=8156; 16 KB host carve_base=0x600000000
+#   carve_mb=8192, a whole number of 32 MiB blocks)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 if [ "${1:-}" = stop ]; then	# end the running hosted system (its disk synced first) and remove xnu.ko
@@ -36,7 +39,7 @@ if [ "${1:-}" = stop ]; then	# end the running hosted system (its disk synced fi
 fi
 WAIT=0; [ "${1:-}" = --wait ] && WAIT=1
 _save_env=()
-for _v in DISK RAM_MB GPU CPUS BOOTARGS CONSOLE_IN INPUT_IN FB_DUMP KEYSTORE TRUSTCACHE IMAGE XNU_ARGS CI_HEADLESS FAST_BOOT FAST_STOP; do
+for _v in DISK RAM_MB GPU CPUS BOOTARGS CONSOLE_IN INPUT_IN FB_DUMP KEYSTORE TRUSTCACHE IMAGE XNU_ARGS CI_HEADLESS FAST_BOOT FAST_STOP CARVE; do
   [ "${!_v+x}" = x ] && _save_env+=("$_v=${!_v}")
 done
 [ -f /etc/xnulinux.conf ] && . /etc/xnulinux.conf
@@ -50,8 +53,18 @@ unset _save_env _v _kv
 CI_HEADLESS=${CI_HEADLESS:-0}; FAST_BOOT=${FAST_BOOT:-0}; FAST_STOP=${FAST_STOP:-0}
 DISK=${DISK:-/var/tmp/mac.img}; RAM_MB=${RAM_MB:-7900}; GPU=${GPU:-auto}; CPUS=${CPUS:-1}
 CONSOLE_IN=${CONSOLE_IN:-/var/tmp/console-in}; INPUT_IN=${INPUT_IN:-/var/tmp/xnu-input}; FB_DUMP=${FB_DUMP:-/var/tmp/xnu-fb.raw}
-KEYSTORE=${KEYSTORE:-$(dirname "$DISK")/keystore.bin}; TRUSTCACHE=${TRUSTCACHE:-xnu/trustcache-mac.bin}; IMAGE=${IMAGE:-xnu/kc.bin}
+# the host's page size is its translation granule, which XNU's own page tables have to match (a 16 KB host: the 16 KB build)
+PAGESZ=$(getconf PAGESIZE)
+if [ "$PAGESZ" = 16384 ]; then DEF_IMAGE=xnu/kc16k.bin; DEF_CARVE="carve_base=0x600000000 carve_mb=8192"
+else DEF_IMAGE=xnu/kc.bin; DEF_CARVE="carve_base=0x200000000 carve_mb=8156"; fi
+KEYSTORE=${KEYSTORE:-$(dirname "$DISK")/keystore.bin}; TRUSTCACHE=${TRUSTCACHE:-xnu/trustcache-mac.bin}; IMAGE=${IMAGE:-$DEF_IMAGE}
 BOOTARGS=${BOOTARGS:-amfi_get_out_of_my_way=1 lp-sip0=2050}
+# The DEVELOPMENT kernel's runtime validations a hosted system does without (a RELEASE kernel has none; the kexts are the
+# same): KF_PMAPV_OVRD 0x4 (duplicate-PV/corruption checks), KF_COMPRSV_OVRD 0x20 (compressor popcount/checksum/c_seg wp),
+# KF_IOTRACE_OVRD 0x100 (MMIO tracing), KF_MACH_ASSERT_OVRD 0x800 (assert(), lck_rw_debug, rwlock-at-return checks), and
+# KF_DISABLE_PROCREF_TRACKING_OVRD 0x20000 (proc-ref backtraces and leaked-procref panics).
+# Measured on a 7-CPU 16 KB guest: spawn_500 -17 %, Lua -j1 -4 %. A BOOTARGS with its own validation_disables= keeps it.
+case " $BOOTARGS " in *" validation_disables="*) ;; *) BOOTARGS="$BOOTARGS validation_disables=0x20924" ;; esac
 if [ "$CI_HEADLESS" = 1 ]; then
   GPU=off
   XNU_ARGS="fb_width=0 fb_height=0 ${XNU_ARGS:-}"
@@ -71,7 +84,11 @@ build xnu-ko "KBUILD_EXTRA_SYMBOLS=$PWD/fki-ko/Module.symvers"
 sudo dmesg -n "${CONLEVEL:-1}"
 # fki has the hosted kernel's DRAM from its load at boot (scripts/vm-install-fki-service.sh): reload it only when it changed,
 # with the same carve-out
-CARVE="carve_base=$(cat /sys/module/fki/parameters/carve_base 2>/dev/null || echo 0x200000000) carve_mb=$(cat /sys/module/fki/parameters/carve_mb 2>/dev/null || echo 8156)"
+if [ -e /sys/module/fki/parameters/carve_base ]; then
+  CARVE="carve_base=$(cat /sys/module/fki/parameters/carve_base) carve_mb=$(cat /sys/module/fki/parameters/carve_mb)"
+else
+  CARVE=${CARVE:-$DEF_CARVE}
+fi
 if [ "$(cat /sys/module/fki/srcversion 2>/dev/null)" != "$(modinfo -F srcversion fki-ko/fki.ko)" ]; then
   sudo systemctl stop xnudrmd 2>/dev/null || true	# it holds fki's /dev/xnu-hostcall
   sudo rmmod fki 2>/dev/null || true

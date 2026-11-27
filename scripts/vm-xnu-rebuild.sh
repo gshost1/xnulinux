@@ -3,10 +3,20 @@
 # Inside the VM: apply xnulinux's XNU patches to the k27 tree, rebuild the kernel incrementally, and (when the macOS 27.2
 # kernelcache is there) relink the kernel collection with Apple's kexts. The kernel's segment slots inside the collection
 # (k27/segaddrs.sh) follow the kernel's size: when kc27-layout.py moves them, the kernel is linked again.
+#
+# XNU_16K=1: the XNU for a Linux host with a 16 KB translation granule (xnu-patches 0006, -DXNU_LINUX64_16K=1), from the same source
+# tree into its own objects (out/k27-16k), segment layout (k27/segaddrs-16k.sh), ArmCpu/ArmDTPlatform archives and kext objects
+# (out/x12377/native-kexts-16k), installed as /lib/firmware/xnu/kc16k.bin and kernel16k.macho; the 4 KB kc.bin stays as it is.
 set -e -o pipefail	# a failed kernel build stops here: never repackage the previous kernel
 cd ~/w/dvm
 export PATH=$PATH:/usr/lib/llvm-21/bin
 T=out/k27/xnu
+XNU_16K=${XNU_16K:-0}; export XNU_16K
+if [ "$XNU_16K" = 1 ]; then SUF=-16k; FW=16k; else SUF=; FW=; fi
+O=out/k27$SUF			# the kernel's objects and outputs (kernel-k27.macho, kc-k27.bin)
+SEG=k27/segaddrs$SUF.sh		# its slots in the collection
+[ -e $SEG ] || { cp k27/segaddrs.sh $SEG; cp k27/segaddrs.json ${SEG%.sh}.json; }
+export NATIVE_KEXTS_DIR=native-kexts$SUF
 # back to the tree's own sources: every file the patches touched last time (.linux64-patched) or touch now, then the
 # patches again. A file that comes out as it was keeps its old time, so the build recompiles only what changed (assert.h
 # and cpu_data.h are included everywhere: touching them rebuilds the whole kernel)
@@ -27,9 +37,9 @@ sudo mkdir -p /lib/firmware/xnu	# not there on a fresh host: the copies below wo
 if [ -e out/kc/kc27.bin ]; then
   # the hosted system's extra Apple kexts (in kc27, not kept by default): IOSurface for actool, CoreImage and friends
   for id in $(grep -v '^#' ~/w/poc/xnu-patches/kc-keep-extra.txt); do grep -qx "$id" configs/kc-keep.txt || echo "$id" >> configs/kc-keep.txt; done
-  cp k27/segaddrs.sh /tmp/segaddrs.before
-  python3 k27/kc27-layout.py out/kc/kc27.bin out/k27/kernel-k27.macho --write k27/segaddrs.sh | tail -2
-  if ! cmp -s /tmp/segaddrs.before k27/segaddrs.sh; then
+  cp $SEG /tmp/segaddrs$SUF.before
+  python3 k27/kc27-layout.py out/kc/kc27.bin $O/kernel-k27.macho --write $SEG | tail -2
+  if ! cmp -s /tmp/segaddrs$SUF.before $SEG; then
     echo "kernel slots moved: linking the kernel again"
     JOBS=12 bash k27/build-kernel27.sh 2>&1 | tail -3
   fi
@@ -48,20 +58,32 @@ if [ -e out/kc/kc27.bin ]; then
       ln -sfn $PWD/${h%%/System/*}/usr/include/TargetConditionals.h $NETINC/TargetConditionals.h
       ln -sfn $PWD/$h/../../HIDDriverKit $NETINC/HIDDriverKit; break; }	# IOHIDDevice.h includes HIDDriverKit/IOHIDDevice.h
   done
+  mkdir -p $O/kexts
   for j in ~/w/poc/kexts/*/*.json; do
     [ -e "$j" ] || continue
     n=$(basename $j .json)
     # a kext that does not build is left out of the collection (reported), not the whole rebuild
-    python3 scripts/build-native-kext.py $n $(dirname $j)/$n.cpp -I $NETINC --obj ${KEXT_OBJ:-k27-obj} || { echo "kext $n failed to build: left out"; continue; }
-    NATIVE="$NATIVE $j"
+    python3 scripts/build-native-kext.py $n $(dirname $j)/$n.cpp -I $NETINC --obj ${KEXT_OBJ:-k27$SUF-obj} || { echo "kext $n failed to build: left out"; continue; }
+    if [ "$XNU_16K" = 1 ]; then	# its description with the 16 KB kernel's objects
+      python3 - "$j" $O/kexts/$n.json "$NATIVE_KEXTS_DIR" <<'PY2'
+import json, sys
+spec = json.load(open(sys.argv[1]))
+if 'objects' in spec:
+    spec['objects'] = spec['objects'].replace('/native-kexts/', '/' + sys.argv[3] + '/')
+json.dump(spec, open(sys.argv[2], 'w'), indent=2)
+PY2
+      NATIVE="$NATIVE $PWD/$O/kexts/$n.json"
+    else
+      NATIVE="$NATIVE $j"
+    fi
   done
   t=$SECONDS; K27_NO_BOOT=1 NATIVE="$NATIVE" bash k27/try.sh 0 2>&1 | tail -3; echo "collection: $((SECONDS - t)) s"
-  grep -iE 'error|unresolved|XnuCpuMetal' out/k27/kc-build.log | tail -8 || true
+  grep -iE 'error|unresolved|XnuCpuMetal' $O/kc-build.log | tail -8 || true
   # AMFI of the collection's macOS expects the code-signature platform version of that build; the system disk's binaries
   # carry their own (macOS 27.0.1: 26 where 27.2's AMFI expects 27)
-  python3 ~/w/poc/scripts/kc-amfi-platform.py out/k27/kc-k27.bin ${AMFI_PLATFORM:-26}
-  sudo cp out/k27/kc-k27.bin /lib/firmware/xnu/kc.bin
+  python3 ~/w/poc/scripts/kc-amfi-platform.py $O/kc-k27.bin ${AMFI_PLATFORM:-26}
+  sudo cp $O/kc-k27.bin /lib/firmware/xnu/kc$FW.bin
 fi
-ls -la out/k27/kernel-k27.macho
-sudo cp out/k27/kernel-k27.macho /lib/firmware/xnu/kernel.macho
+ls -la $O/kernel-k27.macho
+sudo cp $O/kernel-k27.macho /lib/firmware/xnu/kernel$FW.macho
 sync	# the VM may be stopped from the host right after (tart/krunkit stop): unsynced pages of the collection would be lost

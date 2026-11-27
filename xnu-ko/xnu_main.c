@@ -62,11 +62,33 @@ module_param(assert_fatal, int, 0444);
 
 static struct xnu_image img;
 static struct fki_region l2page;
+static struct fki_region empty_ttbr0;	/* 16 KB granule: XNU's first TTBR0, an empty L1 table (Linux's is a 2-entry L0) */
 static unsigned long long *window_slot, *window_l1;
-static unsigned char window_owned[512];
+static unsigned char window_owned[2048];
 static u64_t diag_va[6];
-#define XNU_L1_FIRST 384	/* VM_MIN_KERNEL_ADDRESS 0xffffffe000000000 */
-#define XNU_L1_LAST 495	/* VM_MAX_KERNEL_ADDRESS 0xfffffffbffffffff */
+/*
+ * The host's translation geometry (fki_page_shift): 4 KB granule s = 12, 16 KB s = 14. A table has g_n = 1 << (s - 3) entries;
+ * an L2 entry maps g_block = 1 << g_l2s bytes (2 MiB, 32 MiB), an L1 entry 1 << g_l1s (1 GiB, 64 GiB).
+ */
+static unsigned g_s, g_n, g_l2s, g_l1s;
+static u64_t g_page, g_block;
+/* XNU's kernel VA range in L1 entries: VM_MIN_KERNEL_ADDRESS 0xffffffe000000000 .. VM_MAX_KERNEL_ADDRESS 0xfffffffbffffffff
+ * (4 KB: 384..495; 16 KB: 2046..2047) */
+static unsigned xnu_l1_first, xnu_l1_last;
+static u64_t window_base;	/* the bootstrap window: L2-block aligned, at or below the image's vmlow */
+/*
+ * With a 16 KB granule one L1 entry spans 64 GiB, and the one XNU's image sits in (0xfffffff000000000) also holds Linux's PCI
+ * I/O and fixmap: that "shared" entry is never XNU's to install or clear. Its bootstrap mapping is 32 MiB blocks in Linux's own
+ * L2 table (fki_window_l2_set); at LINUX64_CALL_KERNEL_TABLES the entry is handed to XNU's L2 table, Linux's entries copied
+ * into it (fki_window_l2_adopt), and back to Linux's exactly when the run is over (fki_window_l2_restore).
+ */
+enum { SHARED_NONE, SHARED_BOOT, SHARED_ADOPTED };
+static int shared_state;
+static unsigned shared_idx, shared_hi;		/* the L1 index; XNU's L2 entries are [0, shared_hi) */
+static u64_t shared_va;			/* the shared entry's first address */
+static unsigned boot_count;			/* bootstrap blocks installed in Linux's L2 table, from window_base */
+static fki_u64 saved_l1_desc;			/* Linux's descriptor for the shared entry while XNU's L2 table has it */
+static unsigned long long *adopted_l2_va;
 static void *blob;
 /* A root RAM disk (firmware blob): placed in XNU's DRAM after the ADT, /chosen/memory-map RAMDisk, boot-arg rd=md0. */
 static char *ramdisk;
@@ -210,27 +232,33 @@ module_param(vm16k, int, 0444);
 /* Walk XNU's kernel tables (inside its contiguous DRAM) for va and log the descriptors. */
 static unsigned long long *tbl_va(u64_t desc)
 {
-	u64_t pa = desc & 0x0000fffffffff000ULL;
+	u64_t pa = desc & 0x0000ffffffffffffULL & ~(g_page - 1);
 	if (pa < img.region.pa || pa >= img.region.pa + img.region.size) return 0;
 	return (unsigned long long *)((char *)img.region.va + (pa - img.region.pa));
 }
 
 static void walk_log(const char *what, u64_t va, const unsigned long long *l1)
 {
-	u64_t d1 = l1[(va >> 30) & 511], d2 = 0, d3 = 0;
+	unsigned i1 = (va >> g_l1s) & (g_n - 1), i2 = (va >> g_l2s) & (g_n - 1), i3 = (va >> g_s) & (g_n - 1);
+	u64_t d1 = l1[i1], d2 = 0, d3 = 0;
 	logs(what);
 	logkv("xnu:   va", va);
+	logkv(g_s == 14 ? "xnu:   16K L1 index" : "xnu:   L1 index", i1);
 	logkv("xnu:   L1", d1);
 	if ((d1 & 3) == 3) {
 		unsigned long long *t2 = tbl_va(d1);
 		if (!t2) { logs("xnu:   L2 table outside XNU DRAM"); return; }
-		d2 = t2[(va >> 21) & 511];
+		d2 = t2[i2];
+		logkv("xnu:   L2 index", i2);
 		logkv("xnu:   L2", d2);
 		if ((d2 & 3) == 3) {
 			unsigned long long *t3 = tbl_va(d2);
 			if (!t3) { logs("xnu:   L3 table outside XNU DRAM"); return; }
-			d3 = t3[(va >> 12) & 511];
+			d3 = t3[i3];
+			logkv("xnu:   L3 index", i3);
 			logkv("xnu:   L3", d3);
+		} else if ((d2 & 3) == 1) {
+			logs("xnu:   (L2 block)");
 		}
 	}
 }
@@ -239,8 +267,21 @@ static void walk_log(const char *what, u64_t va, const unsigned long long *l1)
  * Kernel page faults on XNU addresses, taken in Linux's vectors while XNU runs (XNU's keys and stack live), go to
  * XNU's own linux64_kernel_fault (vm_fault on the kernel map). in_xnu is 0 while host code runs (upcalls, monitor).
  */
-static volatile int in_xnu_slot[LINUX64_CPU_SLOTS];
-#define in_xnu in_xnu_slot[this_slot()]
+/*
+ * Each CPU's own state, one 128-byte line per CPU slot (written on every upcall: with plain per-slot arrays the CPUs
+ * shared cache lines and took turns at them): in XNU or in the host, the upcall count and last call (the monitor's
+ * silent-CPU check), the deferred kernel fault, the fault-repeat check, disk bytes (perf=1).
+ */
+struct xnu_slot {
+	volatile int in_xnu;
+	volatile int in_call;
+	unsigned long upcalls, last_call;
+	struct { unsigned long far, esr, pc, pstate; } deferred;
+	unsigned long last_far, repeats;
+	unsigned long acct_disk;
+} __attribute__((aligned(128)));
+static struct xnu_slot xslot[LINUX64_CPU_SLOTS];
+#define in_xnu xslot[this_slot()].in_xnu
 static unsigned long (*xnu_kfault)(unsigned long far, unsigned long esr);
 static unsigned long (*xnu_kfault_recover)(unsigned long pc, unsigned long far, unsigned long esr);
 static unsigned long kfaults;
@@ -256,8 +297,7 @@ static unsigned long kfault_moved;	/* kernel faults whose vm_fault came back on 
  * context, then returns (eret) to the faulting instruction, to the copyio recovery path, or to the abort.
  */
 /* each CPU's: the fault handler and the trampoline it returns into run on the same CPU, with nothing between them */
-static struct { unsigned long far, esr, pc, pstate; } xnu_deferred_slot[LINUX64_CPU_SLOTS];
-#define xnu_deferred xnu_deferred_slot[this_slot()]
+#define xnu_deferred xslot[this_slot()].deferred
 extern void xnu_fault_tramp(void);
 extern void xnu_world_fault_abort(void);
 
@@ -272,11 +312,10 @@ unsigned long xnu_fault_deferred(unsigned long *frame)
 	unsigned long far = xnu_deferred.far, esr = xnu_deferred.esr, pc = xnu_deferred.pc;
 	/* per CPU: with one global record, two CPUs faulting at once reset each other's count, and a CPU looping on one
 	 * address never reached the every-64 yield below (it held its Linux CPU, and Linux with it, for good) */
-	static unsigned long last_far_slot[LINUX64_CPU_SLOTS], repeats_slot[LINUX64_CPU_SLOTS];
 	unsigned s0 = this_slot();
-	unsigned long repeats = (far == last_far_slot[s0]) ? repeats_slot[s0] + 1 : 0;
-	repeats_slot[s0] = repeats;
-	last_far_slot[s0] = far;
+	unsigned long repeats = (far == xslot[s0].last_far) ? xslot[s0].repeats + 1 : 0;
+	xslot[s0].repeats = repeats;
+	xslot[s0].last_far = far;
 
 	frame[31] = xnu_deferred.pstate;	/* the SPSR the trampoline returns with */
 	/*
@@ -428,7 +467,7 @@ static int cpu_fn(void *arg)
  * running, user or kernel). The monitor prints the share of each over its last interval (perf=1).
  */
 #define ACCT_N 64
-static unsigned long acct_ticks_slot[LINUX64_CPU_SLOTS][ACCT_N], acct_calls_slot[LINUX64_CPU_SLOTS][ACCT_N], acct_disk_slot[LINUX64_CPU_SLOTS];
+static unsigned long acct_ticks_slot[LINUX64_CPU_SLOTS][ACCT_N], acct_calls_slot[LINUX64_CPU_SLOTS][ACCT_N];
 static int perf;
 module_param(perf, int, 0644);
 static volatile const unsigned long *xnu_el0_stat;	/* XNU's linux64_el0_stat[cpu][count, ticks][class] */
@@ -443,13 +482,11 @@ static inline void acct_add(unsigned long call, u64_t ticks)
 /* XNU calls into the host: enum linux64_call (linux64_abi.h); a non-zero return ends the run */
 static long xnu_hook_body(unsigned long call, unsigned long a1, unsigned long a2);
 /* each CPU's host calls so far, the last one's number, and whether it is inside one: the monitor's silent-CPU check */
-static unsigned long upcalls_slot[LINUX64_CPU_SLOTS], last_call_slot[LINUX64_CPU_SLOTS];
-static volatile int in_call_slot[LINUX64_CPU_SLOTS];
 long xnu_hook(unsigned long call, unsigned long a1, unsigned long a2)
 {
 	unsigned in_s = this_slot();	/* the thread is bound to its CPU while in the host */
-	upcalls_slot[in_s]++;
-	last_call_slot[in_s] = call;
+	xslot[in_s].upcalls++;
+	xslot[in_s].last_call = call;
 	{
 		/* debugging: an XNU stack Linux's overflow check would reject (bit 14 of sp set) */
 		static int told;
@@ -467,9 +504,9 @@ long xnu_hook(unsigned long call, unsigned long a1, unsigned long a2)
 		return 1;
 	}
 	u64_t t0 = unlikely(perf) ? fki_counter() : 0;
-	in_call_slot[in_s] = 1;
+	xslot[in_s].in_call = 1;
 	long r = xnu_hook_body(call, a1, a2);
-	in_call_slot[in_s] = 0;
+	xslot[in_s].in_call = 0;
 	if (unlikely(perf))
 		acct_add(call, fki_counter() - t0);
 	if (!r) in_xnu = 1;
@@ -524,7 +561,7 @@ static long xnu_hook_body(unsigned long call, unsigned long a1, unsigned long a2
 	if (call == LINUX64_CALL_DISK_RW) {		/* block disk I/O: q->result = bytes moved or -errno */
 		struct linux64_rw_req *q = (struct linux64_rw_req *)a1;
 		if (q) q->result = dk_file ? fki_file_rw(dk_file, (int)q->write, q->buf, (unsigned long)q->len, q->off) : -6;
-		if (q && q->result > 0) acct_disk_slot[this_slot()] += (unsigned long)q->result;
+		if (q && q->result > 0) xslot[this_slot()].acct_disk += (unsigned long)q->result;
 		return 0;
 	}
 	if (call == LINUX64_CALL_DISK_RW_PHYS) {	/* zero-copy block disk I/O at guest physical addr */
@@ -540,7 +577,7 @@ static long xnu_hook_body(unsigned long call, unsigned long a1, unsigned long a2
 		}
 		void *kva = (char *)img.region.va + (pa - base_pa);
 		q->result = fki_file_rw_direct(dk_file, (int)q->write, kva, (unsigned long)len, q->off);
-		if (q->result > 0) acct_disk_slot[this_slot()] += (unsigned long)q->result;
+		if (q->result > 0) xslot[this_slot()].acct_disk += (unsigned long)q->result;
 		return 0;
 	}
 	if (call == LINUX64_CALL_KEYSTORE_RW) {		/* the keystore file: q->result = bytes moved or -errno */
@@ -613,19 +650,40 @@ static long xnu_hook_body(unsigned long call, unsigned long a1, unsigned long a2
 		 * the table is read from a copy taken first, never through the slot being replaced (it faulted in Linux's
 		 * context, an oops, whenever the TLB no longer held the bootstrap entry).
 		 */
-		static unsigned long long tte[512];
-		x_memcpy(tte, (const void *)a1, sizeof(tte));
+		static unsigned long long tte[2048];
+		x_memcpy(tte, (const void *)a1, g_n * sizeof(tte[0]));
 		walk_log("xnu: XNU table walk for arm_init (text)", diag_va[0], tte);
 		walk_log("xnu: XNU table walk for the Mach-O header", diag_va[1], tte);
 		walk_log("xnu: XNU table walk for boot args", diag_va[2], tte);
 		walk_log("xnu: XNU table walk for the cpu_tte page", a1, tte);
 		int n = 0, last = -1;
-		for (int i = XNU_L1_FIRST; i <= XNU_L1_LAST; i++) {
+		for (unsigned i = 0; i < g_n; i++)
+			if ((tte[i] & 1) && (i < xnu_l1_first || i > xnu_l1_last))
+				logkv("xnu: XNU L1 entry outside its kernel VA range, not installed:", i);
+		for (int i = xnu_l1_first; i <= (int)xnu_l1_last; i++) {
 			if (!(tte[i] & 1)) continue;
-			if (window_l1[i] && &window_l1[i] != window_slot) { logkv("xnu: L1 slot in use by Linux, refusing:", i); return 1; }
+			if (shared_state != SHARED_NONE && (unsigned)i == shared_idx) continue;	/* Linux's entry: adopted below */
+			if (window_l1[i] && !window_owned[i]) { logkv("xnu: L1 slot in use by Linux, refusing:", i); return 1; }
 			window_l1[i] = tte[i]; window_owned[i] = 1; n++; last = i;
 		}
 		if (last >= 0) fki_window_set(&window_l1[last], tte[last]);	/* barrier + TLB flush */
+		if (shared_state == SHARED_BOOT) {
+			u64_t d = tte[shared_idx], l2pa = d & 0x0000ffffffffffffULL & ~(g_page - 1);
+			if ((d & 3) != 3 || l2pa < img.region.pa || l2pa + g_page > img.region.pa + img.region.size) {
+				logkv("xnu: XNU has no L2 table in its DRAM for the shared L1 slot, refusing:", d);
+				return 1;
+			}
+			unsigned long long *nl2 = (unsigned long long *)((char *)img.region.va + (l2pa - img.region.pa));
+			int e = fki_window_l2_adopt(shared_va, nl2, d, 0, shared_hi, &saved_l1_desc);
+			if (e) { logkv("xnu: the shared L1 slot could not be handed to XNU's L2 table, err", (u64_t)(long)e); return 1; }
+			shared_state = SHARED_ADOPTED;
+			adopted_l2_va = nl2;
+			boot_count = 0;		/* fki cleared the bootstrap blocks from Linux's table */
+			logkv("xnu: shared L1 slot adopted: XNU's L2 table at phys", l2pa);
+			logkv("xnu:   XNU's L2 entries [0, n)", shared_hi);
+			logkv("xnu:   Linux's L1 descriptor saved", saved_l1_desc);
+			n++;
+		}
 		logkv("xnu: XNU L1 entries installed", n);
 		/* Touch XNU memory through XNU's own tables now (Linux context: a fault here is a readable oops). */
 		logkv("xnu: probe text word", *(volatile unsigned int *)diag_va[0]);
@@ -917,7 +975,7 @@ static struct boot_args_v2 *build_boot(unsigned char *base_va, u64_t phys, u64_t
 	ba->deviceTreeLength = (unsigned)dt_len;
 	x_memcpy(ba->CommandLine, cmdline, x_strlen(cmdline) + 1);
 	{
-		const char *pg = vm16k ? cmdline_16k : cmdline_4k;
+		const char *pg = (vm16k || g_s == 14) ? cmdline_16k : cmdline_4k;	/* a 16 KB host: 16 KB pages, always */
 		x_memcpy(ba->CommandLine + x_strlen(ba->CommandLine), pg, x_strlen(pg) + 1);
 	}
 	if (rd_size || hd_file) {
@@ -996,7 +1054,7 @@ static void acct_report(void)
 		}
 	}
 	unsigned long disk = 0;
-	for (unsigned s = 0; s < LINUX64_CPU_SLOTS; s++) disk += READ_ONCE(acct_disk_slot[s]);
+	for (unsigned s = 0; s < LINUX64_CPU_SLOTS; s++) disk += READ_ONCE(xslot[s].acct_disk);
 	put_str(&p, "%o diskKB="); p = put_dec(p, (disk - last_disk) >> 10);
 	last_disk = disk;
 	*p = 0;
@@ -1026,7 +1084,7 @@ static int monitor_fn(void *arg)
 			static unsigned long seen[XNU_MAX_CPUS], still[XNU_MAX_CPUS];
 			for (int c = 0; c < cpus && xnu_dbg; c++) {
 				unsigned s = LINUX64_CPU_SLOT(cpu_mpidr[c]);
-				if ((c && !cpu_running[c]) || upcalls_slot[s] != seen[c]) { seen[c] = upcalls_slot[s]; still[c] = 0; continue; }
+				if ((c && !cpu_running[c]) || xslot[s].upcalls != seen[c]) { seen[c] = xslot[s].upcalls; still[c] = 0; continue; }
 				if (++still[c] == 1) {
 					struct xnu_world *w = xnu_worlds[s];
 					unsigned long fp = w->xnu_regs[10];
@@ -1034,13 +1092,13 @@ static int monitor_fn(void *arg)
 						char ab[160]; char *q = ab;
 						put_str(&q, "xnu: XNU CPU "); q = put_dec(q, (unsigned long)c);
 						put_str(&q, " made no host call for 2 s (its Linux CPU held, interrupts masked); last call ");
-						q = put_dec(q, last_call_slot[s]); put_str(&q, in_call_slot[s] ? " (inside it)" : " (back in XNU)");
+						q = put_dec(q, xslot[s].last_call); put_str(&q, xslot[s].in_call ? " (inside it)" : " (back in XNU)");
 						*q = 0;
 						logs_alert(ab);
 					}
 					logkv("xnu: XNU CPU silent for 2 s (no host call), cpu", (u64_t)c);
-					logkv("xnu:   its last host call", last_call_slot[s]);
-					logkv("xnu:   still inside it (1) or back in XNU (0)", in_call_slot[s]);
+					logkv("xnu:   its last host call", xslot[s].last_call);
+					logkv("xnu:   still inside it (1) or back in XNU (0)", xslot[s].in_call);
 					logkv("xnu:   lr at that call", w->xnu_regs[11]);
 					for (int f = 0; f < 16 && fp >= XNU_VA_LO && fp < XNU_VA_HI && !(fp & 7); f++) {
 						logkv("xnu:   frame", ((unsigned long *)fp)[1]);
@@ -1054,7 +1112,7 @@ static int monitor_fn(void *arg)
 			put_str(&q, "xnu: calls");
 			for (int c = 0; c < cpus; c++) {
 				unsigned s = LINUX64_CPU_SLOT(cpu_mpidr[c]);
-				put_str(&q, " "); q = put_dec(q, upcalls_slot[s]); put_str(&q, "/"); q = put_dec(q, last_call_slot[s]);
+				put_str(&q, " "); q = put_dec(q, xslot[s].upcalls); put_str(&q, "/"); q = put_dec(q, xslot[s].last_call);
 			}
 			*q = 0;
 			logs(cb);
@@ -1149,6 +1207,24 @@ static int enter_arm_init(struct boot_args_v2 *ba)
 		 */
 		xnu_W.xnu_tcr = tcr & ~(1ULL << 22);
 		xnu_W.xnu_ttbr0 = ttbr0;
+		if (g_s == 14) {
+			/*
+			 * 16 KB granule: XNU's user pmaps are 3-level from a 2048-entry L1 root over 47 bits (T0SZ 17, TG0 16 KB, as
+			 * Linux's TG0 already is), not Linux's 4-level T0SZ 16. Until XNU's first pmap switch TTBR0 is an empty L1
+			 * table: Linux's own TTBR0 is a 2-entry L0, which a 3-level walk would take for an L1.
+			 */
+			xnu_W.xnu_tcr = (tcr & ~((1ULL << 22) | 0x3fULL)) | 17ULL;
+			if (!empty_ttbr0.va) {
+				int e = fki_contig_alloc(g_page, &empty_ttbr0);
+				if (e) { empty_ttbr0.va = 0; logs("xnu: no page for XNU's first TTBR0"); return e; }
+			}
+			xnu_W.xnu_ttbr0 = empty_ttbr0.pa;
+		}
+		logkv("xnu: Linux TCR_EL1", tcr);
+		logkv("xnu: XNU TCR_EL1", xnu_W.xnu_tcr);
+		logkv("xnu:   T0SZ", xnu_W.xnu_tcr & 0x3f);
+		logkv("xnu:   TG0 (0: 4K, 2: 16K)", (xnu_W.xnu_tcr >> 14) & 3);
+		logkv("xnu: XNU first TTBR0", xnu_W.xnu_ttbr0);
 	}
 	a_cpu_entry = macho_sym(&img, "_linux64_cpu_entry");
 	for (int c = 1; c < cpus; c++) {	/* the secondary CPUs' save areas start as the boot CPU's: XNU's keys, user TTBR0/TCR */
@@ -1196,68 +1272,130 @@ static int run_m2a(void)
  * M2b: XNU at its own link address in the top foreign window, on physically contiguous memory with real
  * physical addresses, so that the page tables XNU builds can be walked by the hardware.
  */
-#define XNU_WINDOW_BASE (img.vmlow & ~0x1fffffULL)	/* 2 MiB aligned, at or below the image's vmlow */
-
 static int run_m2b(void)
 {
 	u64_t image_size = img.vmhigh - img.vmlow;
-	if (img.vmlow < 0xffffffe000000000ULL) { logs("xnu: unexpected link address"); return -22; }
-	u64_t image_off = img.vmlow - XNU_WINDOW_BASE;
+	if (img.vmlow < XNU_VA_LO || img.vmhigh > XNU_VA_HI) { logs("xnu: unexpected link address"); return -22; }
+	window_base = img.vmlow & ~(g_block - 1);
+	u64_t image_off = img.vmlow - window_base;
 	u64_t want = image_off + image_size + 0x60000 + BOOT_EXTRA + ((u64_t)ram_mb << 20);
 	int err = fki_contig_alloc(want, &img.region);
-	if (err) { logkv("xnu: contiguous allocation failed, err", (u64_t)err); return err; }
+	if (err) { img.region.va = 0; logkv("xnu: contiguous allocation failed, err", (u64_t)err); return err; }
 	logkv("xnu: contiguous DRAM at phys", img.region.pa);
 	logkv("xnu: contiguous DRAM size", img.region.size);
-	if (img.region.pa & 0x1fffff) { logs("xnu: region not 2 MiB aligned"); return -22; }
+	if (img.region.pa & (g_block - 1)) { logkv("xnu: region not aligned to the L2 block size", g_block); return -22; }
 
-	err = fki_contig_alloc(4096, &l2page);
-	if (err) return err;
-	unsigned long long *l2 = l2page.va;
-	unsigned first = (XNU_WINDOW_BASE >> 21) & 511;
+	unsigned long long *l1; fki_u64 l1pa;
+	err = fki_window_l1(window_base, &l1, &l1pa);
+	if (err) { logs("xnu: no L1 table for the top window"); return err; }
+	window_l1 = l1;
+	unsigned idx = (window_base >> g_l1s) & (g_n - 1);
+	unsigned first = (window_base >> g_l2s) & (g_n - 1);
+	u64_t slot_va = window_base & ~((1ULL << g_l1s) - 1);
+	/* XNU's L2 entries in the window's L1 slot: up to VM_MAX_KERNEL_ADDRESS (16 KB: [0, 1536) of 0xfffffff000000000's) */
+	unsigned hi = g_n;
+	if (XNU_VA_HI - slot_va < ((u64_t)g_n << g_l2s)) hi = (unsigned)((XNU_VA_HI - slot_va) >> g_l2s);
 	/*
-	 * One bootstrap L2 table: map what fits in the window's 1 GiB L1 slot. XNU only touches the image, the
-	 * boot data and its first bootstrap allocations before it hands us its own kernel L1 entries (stage 210),
-	 * which map all of its DRAM, so DRAM beyond the slot needs no bootstrap mapping.
+	 * The bootstrap mapping: L2 blocks over what fits in the window's L1 slot. XNU only touches the image, the boot data and
+	 * its first bootstrap allocations before it hands us its own kernel L1 entries (LINUX64_CALL_KERNEL_TABLES), which map
+	 * all of its DRAM, so DRAM beyond the slot needs no bootstrap mapping.
 	 */
-	u64_t boot_map = img.region.size;
-	if (boot_map > ((u64_t)(512 - first) << 21)) boot_map = (u64_t)(512 - first) << 21;
+	u64_t boot_map = img.region.size & ~(g_block - 1);
+	if (first >= hi) { logs("xnu: the image is above XNU's kernel VA range"); return -22; }
+	if (boot_map > ((u64_t)(hi - first) << g_l2s)) boot_map = (u64_t)(hi - first) << g_l2s;
 	if (boot_map < image_off + image_size + 0x60000 + BOOT_EXTRA + (64ULL << 20)) {
 		logs("xnu: image and boot data do not fit in the bootstrap window"); return -22;
 	}
-	logkv("xnu: bootstrap window base", XNU_WINDOW_BASE);
+	logkv("xnu: translation granule shift", g_s);
+	logkv("xnu: bootstrap window base", window_base);
 	logkv("xnu: bootstrap window bytes", boot_map);
-	for (u64_t o = 0; o < boot_map; o += 0x200000) {
-		/* 2 MiB block: normal WB (AttrIdx 0 in Linux's MAIR), inner shareable, AF, EL1 RWX, UXN */
-		l2[first + (o >> 21)] = (img.region.pa + o) | (1ULL << 54) | (1ULL << 10) | (3ULL << 8) | 1;
-	}
-	unsigned long long *l1; fki_u64 l1pa;
-	err = fki_window_l1(XNU_WINDOW_BASE, &l1, &l1pa);
-	if (err) { logs("xnu: no L1 table for the top window"); return err; }
-	unsigned idx = (XNU_WINDOW_BASE >> 30) & 511;
+	logkv("xnu: bootstrap L2 block bytes", g_block);
 	logkv("xnu: top window L1 table at phys", l1pa);
 	logkv("xnu: L1 slot", idx);
-	if (l1[idx]) { logkv("xnu: L1 slot already used by Linux:", l1[idx]); return -16; }
-	window_slot = &l1[idx];
-	window_l1 = l1;
-	window_owned[idx] = 1;
-	fki_window_set(window_slot, l2page.pa | 3);
-	logs("xnu: bootstrap window mapped");
+	/* L2 block: normal WB (AttrIdx 0 in Linux's MAIR), inner shareable, AF, EL1 RWX, UXN */
+#define BOOT_BLOCK(o) ((img.region.pa + (o)) | (1ULL << 54) | (1ULL << 10) | (3ULL << 8) | 1)
+	u64_t l1e = l1[idx];
+	if (!l1e) {
+		/* the slot is empty (4 KB granule: a 1 GiB slot of its own): a bootstrap L2 table of ours */
+		err = fki_contig_alloc(g_page, &l2page);
+		if (err) { l2page.va = 0; return err; }
+		unsigned long long *l2 = l2page.va;
+		for (u64_t o = 0; o < boot_map; o += g_block)
+			l2[first + (o >> g_l2s)] = BOOT_BLOCK(o);
+		window_slot = &l1[idx];
+		window_owned[idx] = 1;
+		fki_window_set(window_slot, l2page.pa | 3);
+		logs("xnu: bootstrap window mapped (own L2 table)");
+	} else if ((l1e & 3) == 3) {
+		/* Linux's (16 KB granule: XNU's top 48 GiB share a 64 GiB slot with Linux's PCI I/O and fixmap) */
+		logkv("xnu: L1 slot shared with Linux, its descriptor", l1e);
+		shared_idx = idx;
+		shared_va = slot_va;
+		shared_hi = hi;
+		shared_state = SHARED_BOOT;
+		for (u64_t o = 0; o < boot_map; o += g_block) {
+			err = fki_window_l2_set(window_base + o, BOOT_BLOCK(o));
+			if (err) {
+				logkv("xnu: bootstrap L2 entry in use by Linux, index", first + (o >> g_l2s));
+				return err;
+			}
+			boot_count++;
+		}
+		logkv("xnu: bootstrap window mapped in Linux's L2 table, blocks", boot_count);
+		logkv("xnu:   from L2 index", first);
+	} else {
+		logkv("xnu: L1 slot is a block of Linux's:", l1e);
+		return -16;
+	}
+#undef BOOT_BLOCK
 
-	unsigned char *base = (unsigned char *)XNU_WINDOW_BASE;
+	unsigned char *base = (unsigned char *)window_base;
 	macho_copy(&img, base + image_off);
 	img.slide = 0;
+	{	/* the granule XNU was built for: its page tables are the hardware's, so it has to be the host's */
+		u64_t gs = macho_sym(&img, "_linux64_granule_shift");
+		if (gs) {
+			unsigned v = *(volatile unsigned int *)gs;
+			logkv("xnu: XNU built for granule shift", v);
+			if (v != g_s) { logs("xnu: XNU was built for another translation granule than the host's: refusing"); return -22; }
+		} else if (g_s != 12) {
+			logs("xnu: XNU without linux64_granule_shift (a 4 KB build) on a 16 KB host: refusing (IMAGE=xnu/kc16k.bin)");
+			return -22;
+		}
+	}
 	struct boot_args_v2 *ba = build_boot(base, img.region.pa, img.region.size, image_off, image_size);
 	if (!ba) return -22;
 	return enter_arm_init(ba);
 }
 
+static void xnu_cleanup(void);
+static int xnu_init_body(void);
 static int __init xnu_init(void)
+{
+	int err = xnu_init_body();
+	if (err) {
+		logkv("xnu: load failed, cleaning up, err", (u64_t)(long)err);
+		xnu_cleanup();
+	}
+	return err;
+}
+
+static int xnu_init_body(void)
 {
 	const void *data; unsigned long size;
 	int err;
 
 	if (fki_version() != 0)
 		return -22;
+	g_s = fki_page_shift();
+	if (g_s != 12 && g_s != 14) { logkv("xnu: unsupported host translation granule shift", g_s); return -22; }
+	g_n = 1U << (g_s - 3);
+	g_l2s = g_s + (g_s - 3);
+	g_l1s = g_s + 2 * (g_s - 3);
+	g_page = 1ULL << g_s;
+	g_block = 1ULL << g_l2s;
+	xnu_l1_first = (unsigned)((XNU_VA_LO >> g_l1s) & (g_n - 1));
+	xnu_l1_last = (unsigned)(((XNU_VA_HI - 1) >> g_l1s) & (g_n - 1));
 	if (ramdisk) {
 		err = fki_blob_get(ramdisk, &rd_data, &rd_size, &rd_blob);
 		if (err) { logkv("xnu: cannot read the RAM disk, err", (u64_t)err); return err; }
@@ -1310,25 +1448,54 @@ static int __init xnu_init(void)
 	return mode == 1 ? run_m1() : mode == 3 ? run_m2b() : run_m2a();
 }
 
-static void __exit xnu_exit(void)
+/*
+ * Everything the load set up, in reverse: from the module's exit and from every failed load. The shared L1 entry is never
+ * cleared (it is Linux's): adopted, it goes back to Linux's exact descriptor; at bootstrap only our blocks leave its table.
+ */
+static void xnu_cleanup(void)
 {
+	if (shared_state == SHARED_ADOPTED) {
+		fki_window_l2_restore(shared_va, adopted_l2_va, saved_l1_desc, 0, shared_hi);
+		if (window_l1) logkv("xnu: shared L1 slot restored to Linux's descriptor", window_l1[shared_idx]);
+		if (window_l1 && window_l1[shared_idx] != saved_l1_desc) logs("xnu: shared L1 slot NOT back to the saved descriptor");
+		shared_state = SHARED_NONE;
+		adopted_l2_va = 0;
+	}
+	if (shared_state == SHARED_BOOT) {
+		for (unsigned k = 0; k < boot_count; k++)
+			if (fki_window_l2_set(window_base + (u64_t)k * g_block, 0))
+				logkv("xnu: could not clear bootstrap block", k);
+		boot_count = 0;
+		shared_state = SHARED_NONE;
+	}
 	if (window_l1) {
 		int last = -1;
-		for (int i = 0; i < 512; i++) if (window_owned[i]) { window_l1[i] = 0; last = i; }
+		for (unsigned i = 0; i < g_n && i < sizeof(window_owned); i++)
+			if (window_owned[i]) { window_l1[i] = 0; window_owned[i] = 0; last = (int)i; }
 		if (last >= 0) fki_window_set(&window_l1[last], 0);
+		window_l1 = 0;
+		window_slot = 0;
 	}
 	if (mode == 3) {
 		if (img.region.va) fki_contig_free(&img.region);
 		if (l2page.va) fki_contig_free(&l2page);
 	} else if (img.region.va) fki_region_free(&img.region);
-	if (blob) fki_blob_put(blob);
-	if (rd_blob) fki_blob_put(rd_blob);
-	if (tc_blob) fki_blob_put(tc_blob);
-	if (hd_file) fki_file_close(hd_file);
-	if (ks_file) fki_file_close(ks_file);
-	if (dk_file) fki_file_close(dk_file);
-	if (ci_file) fki_file_close(ci_file);
-	if (in_file) fki_file_close(in_file);
+	img.region.va = 0;
+	l2page.va = 0;
+	if (empty_ttbr0.va) { fki_contig_free(&empty_ttbr0); empty_ttbr0.va = 0; }
+	if (blob) { fki_blob_put(blob); blob = 0; }
+	if (rd_blob) { fki_blob_put(rd_blob); rd_blob = 0; }
+	if (tc_blob) { fki_blob_put(tc_blob); tc_blob = 0; }
+	if (hd_file) { fki_file_close(hd_file); hd_file = 0; }
+	if (ks_file) { fki_file_close(ks_file); ks_file = 0; }
+	if (dk_file) { fki_file_close(dk_file); dk_file = 0; }
+	if (ci_file) { fki_file_close(ci_file); ci_file = 0; }
+	if (in_file) { fki_file_close(in_file); in_file = 0; }
+}
+
+static void __exit xnu_exit(void)
+{
+	xnu_cleanup();
 }
 
 module_init(xnu_init);
