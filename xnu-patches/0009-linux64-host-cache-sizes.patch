@@ -1,0 +1,37 @@
+linux64: cache sizes from the host (boot-args xnu-cache-l1i/l1d/l2) when the hypervisor reports a made-up CCSIDR geometry
+---
+diff --git a/osfmk/arm/cpuid.c b/osfmk/arm/cpuid.c
+index 2b838e7..269f1ea 100644
+--- a/osfmk/arm/cpuid.c
++++ b/osfmk/arm/cpuid.c
+@@ -525,6 +525,30 @@ do_cacheid(void)
+ 		cpuid_cache_info_p->c_isize = (arm_cache_ccsidr_info.bits.NumSets + 1) * c_linesz * c_assoc;
+ 	}
+ 
++	/*
++	 * LINUX64 (xnulinux): a hypervisor that traps CCSIDR_EL1 can answer with a made-up geometry: on Google's C4A (Neoverse
++	 * V2) it reads 0x1a / 0x3a, one set of 4 or 8 ways, so hw.l1dcachesize was 256 bytes and hw.l2cachesize 512 instead of
++	 * 64 KB and 2 MB. The host knows the real sizes (its cacheinfo, from the firmware's tables) and passes them as
++	 * boot-args (scripts/xnulinux-boot.sh): xnu-cache-l1i, xnu-cache-l1d, xnu-cache-l2 (bytes).
++	 */
++	{
++		uint32_t bytes;
++		if (PE_parse_boot_argn("xnu-cache-l1i", &bytes, sizeof(bytes)) && bytes) {
++			cpuid_cache_info_p->c_isize = bytes;
++		}
++		if (PE_parse_boot_argn("xnu-cache-l1d", &bytes, sizeof(bytes)) && bytes) {
++			cpuid_cache_info_p->c_dsize = bytes;
++			cpuid_cache_info_p->c_inner_cache_size = bytes;
++			if (cpuid_cache_info_p->c_l2size == 0) {
++				cpuid_cache_info_p->c_bulksize_op = bytes;
++			}
++		}
++		if (PE_parse_boot_argn("xnu-cache-l2", &bytes, sizeof(bytes)) && bytes) {
++			cpuid_cache_info_p->c_l2size = bytes;
++			cpuid_cache_info_p->c_bulksize_op = bytes;
++		}
++	}
++
+ 	if (cpuid_cache_info_p == cpuid_cache_info_boot_cpu) {
+ 		cpuid_cache_info_p->c_valid = true;
+ 	} else {

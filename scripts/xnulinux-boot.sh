@@ -70,6 +70,22 @@ BOOTARGS=${BOOTARGS:-amfi_get_out_of_my_way=1 lp-sip0=2050}
 # KF_DISABLE_PROCREF_TRACKING_OVRD 0x20000 (proc-ref backtraces and leaked-procref panics).
 # Measured on a 7-CPU 16 KB guest: spawn_500 -17 %, Lua -j1 -4 %. A BOOTARGS with its own validation_disables= keeps it.
 case " $BOOTARGS " in *" validation_disables="*) ;; *) BOOTARGS="$BOOTARGS validation_disables=0x20924" ;; esac
+# The host's cache sizes (xnu-cache-l1i/l1d/l2, bytes; xnu-patches 0008): a hypervisor that traps CCSIDR_EL1 can report a
+# made-up geometry (Google's C4A: one set, so XNU saw a 256-byte L1 and a 512-byte L2). Linux has the real ones from the
+# firmware's tables. A BOOTARGS with its own xnu-cache- values keeps them.
+host_cache_args() {
+  local d sz out=
+  for d in /sys/devices/system/cpu/cpu0/cache/index*; do
+    [ -r "$d/size" ] || continue
+    sz=$(cat "$d/size")
+    case $sz in *K) sz=$((${sz%K} * 1024)) ;; *M) sz=$((${sz%M} * 1048576)) ;; *[!0-9]*) continue ;; esac
+    case "$(cat "$d/level")/$(cat "$d/type")" in
+      1/Instruction) out="$out xnu-cache-l1i=$sz" ;; 1/Data) out="$out xnu-cache-l1d=$sz" ;; 2/Unified) out="$out xnu-cache-l2=$sz" ;;
+    esac
+  done
+  echo $out
+}
+case " $BOOTARGS " in *" xnu-cache-"*) ;; *) BOOTARGS="$BOOTARGS $(host_cache_args)" ;; esac
 if [ "$CI_HEADLESS" = 1 ]; then
   GPU=off
   XNU_ARGS="fb_width=0 fb_height=0 ${XNU_ARGS:-}"
