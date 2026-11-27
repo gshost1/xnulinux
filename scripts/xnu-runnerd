@@ -1,0 +1,1146 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""xnu-runnerd: host fleet supervisor for ephemeral headless macOS CI jobs on xnulinux.
+
+Every job gets a fresh RAM-backed dm-snapshot copy-on-write overlay over a read-only golden
+mac.img, a fresh keystore copy, and a CI_HEADLESS=1 FAST_BOOT=1 boot with early-boot retry
+supervision. The job runs inside the guest over SSH; teardown removes the guest, the snapshot,
+the loop devices and every /dev/shm file, so the golden image is never written.
+
+Modes:
+  mock-queue   run executable *.sh jobs from --queue-dir (claimed by atomic rename to .running,
+               then .done), or --job-script PATH for --count N consecutive jobs
+  github-jit   mint a just-in-time runner config (generate-jitconfig) per job and start
+               ~/actions-runner/run.sh --jitconfig inside the guest (config passed on SSH stdin)
+  github-reg   fallback: registration token on SSH stdin into config.sh --ephemeral && run.sh
+
+The GitHub token is read only from --token-file or the GITHUB_TOKEN environment variable. It is
+never accepted on the command line, never logged, never passed to child processes, and the
+runner config/registration token only ever travels over SSH stdin.
+
+Each job appends one JSON line to --telemetry-log. --dry-run simulates the whole state machine
+without sudo, insmod, dmsetup, losetup or ssh (XNU_RUNNERD_DRY_FAIL_FIRST=N makes the first boot
+attempt of the first N jobs fail; XNU_RUNNERD_DRY_FAIL_ALL=1 makes every boot attempt fail).
+"""
+
+import argparse
+import contextlib
+import datetime
+import fcntl
+import json
+import logging
+import os
+import re
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+
+VERSION = "1.0.0"
+DM_PREFIX = "xnu-runnerd-cow-"
+SHM_PREFIX = "xnu-runnerd-"
+FAILURE_RE = re.compile(r"XNU panic|userspace panic|posix_spawn.*14|Bad address|run ended by")
+LEASES = "/var/lib/misc/dnsmasq.leases"
+STATIC_GUEST_IP = "192.168.77.2"
+TX_DROPPED = "/sys/class/net/xnu0/statistics/tx_dropped"
+GUEST_SCRATCH = "/Volumes/CIScratch"
+SECRET_ENV = ("GITHUB_TOKEN", "GH_TOKEN", "GITHUB_PAT")
+REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+LABEL_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+PREFIX_RE = re.compile(r"^[A-Za-z0-9_.-]{1,40}$")
+
+log = logging.getLogger("xnu-runnerd")
+
+
+# --------------------------------------------------------------------------- utilities
+
+class Stop(Exception):
+    """SIGTERM/SIGINT: finish the current teardown and exit."""
+
+
+class BootFailed(Exception):
+    pass
+
+
+class FatalError(Exception):
+    pass
+
+
+class Redactor(logging.Filter):
+    """Replaces every registered secret in log records (defence in depth: secrets are never
+    passed to the logger on purpose)."""
+
+    def __init__(self):
+        super().__init__()
+        self.secrets = set()
+
+    def add(self, value):
+        if value and len(value) >= 6:
+            self.secrets.add(value)
+
+    def filter(self, record):
+        if self.secrets:
+            msg = record.getMessage()
+            for s in self.secrets:
+                msg = msg.replace(s, "***")
+            record.msg, record.args = msg, None
+        return True
+
+
+REDACTOR = Redactor()
+
+
+class SignalState:
+    def __init__(self):
+        self.stop_requested = False
+        self.signum = None
+        self.shield_depth = 0
+        self.raised = False
+
+    def handler(self, signum, _frame):
+        first = not self.stop_requested
+        self.stop_requested = True
+        self.signum = signum
+        if first:
+            log.warning("received %s: stopping after cleanup", signal.Signals(signum).name)
+        if self.shield_depth == 0 and not self.raised:
+            self.raised = True
+            raise Stop(signum)
+
+    @contextlib.contextmanager
+    def shielded(self, raise_after=True):
+        """Signals arriving inside are deferred to the end of the block, so a resource is never
+        half-created or half-removed. With raise_after=False the stop is only recorded (the job
+        loops check stop_requested), for blocks that run inside cleanup paths."""
+        self.shield_depth += 1
+        try:
+            yield
+        finally:
+            self.shield_depth -= 1
+        if raise_after and self.shield_depth == 0 and self.stop_requested and not self.raised:
+            self.raised = True
+            raise Stop(self.signum)
+
+
+SIG = SignalState()
+
+
+def mono():
+    return time.monotonic()
+
+
+def utc_now():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def child_env(extra=None):
+    env = {k: v for k, v in os.environ.items() if k not in SECRET_ENV}
+    if extra:
+        env.update(extra)
+    return env
+
+
+def parse_size(s):
+    m = re.fullmatch(r"(\d+)([KMGT]?)i?B?", s.strip(), re.I)
+    if not m:
+        raise argparse.ArgumentTypeError(f"bad size {s!r} (e.g. 12G)")
+    mult = {"": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}[m.group(2).upper()]
+    return int(m.group(1)) * mult
+
+
+def detect_poc_dir():
+    here = os.path.dirname(os.path.realpath(__file__))
+    cands = [os.environ.get("XNU_POC_DIR", ""), os.path.dirname(here),
+             os.path.expanduser("~/xnulinux"), os.path.expanduser("~/w/poc"), "/opt/xnulinux"]
+    for c in cands:
+        if c and os.path.isfile(os.path.join(c, "scripts", "xnulinux-boot.sh")):
+            return c
+    return os.path.dirname(here)
+
+
+def golden_stat(path):
+    st = os.stat(path)
+    return (st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def stream_process(argv, *, stdin_data=None, stdin_path=None, log_path, prefix, env=None, cwd=None,
+                   timeout=0, start_marker=None, start_timeout=0):
+    """Runs argv, copying its output to log_path and stderr. Returns (rc, reason) with reason in
+    {None, 'timeout', 'idle'}. Kills the process group on Stop or timeout."""
+    stdin = subprocess.DEVNULL
+    fin = None
+    if stdin_path:
+        fin = open(stdin_path, "rb")
+        stdin = fin
+    elif stdin_data is not None:
+        stdin = subprocess.PIPE
+    started = threading.Event()
+    with open(log_path, "ab") as flog:
+        p = subprocess.Popen(argv, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             env=env, cwd=cwd, start_new_session=True)
+
+        def reader():
+            for line in iter(p.stdout.readline, b""):
+                flog.write(line)
+                flog.flush()
+                try:
+                    sys.stderr.write(prefix + line.decode("utf-8", "replace"))
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                if start_marker and start_marker in line:
+                    started.set()
+
+        th = threading.Thread(target=reader, daemon=True)
+        th.start()
+        reason = None
+        t0 = mono()
+        try:
+            if stdin_data is not None:
+                try:
+                    p.stdin.write(stdin_data)
+                    p.stdin.close()
+                except BrokenPipeError:
+                    pass
+            while True:
+                try:
+                    rc = p.wait(timeout=0.5)
+                    break
+                except subprocess.TimeoutExpired:
+                    now = mono() - t0
+                    if timeout and now > timeout:
+                        reason = "timeout"
+                    elif start_marker and start_timeout and not started.is_set() and now > start_timeout:
+                        reason = "idle"
+                    if reason:
+                        log.warning("%s: %s after %.0fs, killing", prefix.strip(), reason, now)
+                        kill_group(p)
+                        rc = 124
+                        break
+        except BaseException:
+            kill_group(p)
+            raise
+        finally:
+            th.join(timeout=5)
+            if fin:
+                fin.close()
+    return rc, reason
+
+
+def kill_group(p):
+    for sig, wait in ((signal.SIGTERM, 3), (signal.SIGKILL, 3)):
+        if p.poll() is not None:
+            return
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(p.pid, sig)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            p.wait(timeout=wait)
+
+
+# --------------------------------------------------------------------------- hosts
+
+SSH_OPTS = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR",
+            "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=8"]
+
+
+class RealHost:
+    dry = False
+
+    def __init__(self, a):
+        self.a = a
+
+    # -- privileged helpers
+    def sudo(self, *cmd, check=True, timeout=60):
+        r = subprocess.run(["sudo", "-n", *cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           text=True, timeout=timeout, env=child_env())
+        if check and r.returncode != 0:
+            raise RuntimeError(f"{' '.join(cmd[:2])} failed rc={r.returncode}: {r.stderr.strip()[:300]}")
+        return r
+
+    def attach_loop(self, path, read_only):
+        cmd = ["losetup", "--find", "--show"] + (["--read-only"] if read_only else []) + [path]
+        return self.sudo(*cmd).stdout.strip()
+
+    def sectors(self, dev):
+        return int(self.sudo("blockdev", "--getsz", dev).stdout.strip())
+
+    def dm_create(self, name, table):
+        self.sudo("dmsetup", "create", name, "--table", table)
+
+    def dm_remove(self, name):
+        r = self.sudo("dmsetup", "remove", "--retry", name, check=False)
+        if r.returncode != 0:
+            time.sleep(0.3)
+            self.sudo("dmsetup", "remove", "--retry", name)
+
+    def loop_detach(self, dev):
+        self.sudo("losetup", "-d", dev)
+
+    def xnu_loaded(self):
+        with contextlib.suppress(OSError):
+            with open("/proc/modules") as f:
+                return any(line.startswith("xnu ") for line in f)
+        return False
+
+    # -- guest lifecycle
+    def boot_start(self, env, log_path, attempt, job_index):
+        tc_src = os.path.join(self.a.golden, "trustcache.bin")
+        tc_dst = "/lib/firmware/xnu/trustcache-mac.bin"
+        if os.path.isfile(tc_src):
+            same = False
+            with contextlib.suppress(OSError):
+                if os.path.getsize(tc_src) == os.path.getsize(tc_dst):
+                    with open(tc_src, "rb") as f1, open(tc_dst, "rb") as f2:
+                        same = (f1.read() == f2.read())
+            if not same:
+                self.sudo("install", "-m", "0644", tc_src, tc_dst)
+        with open(log_path, "ab") as flog:
+            r = subprocess.run(["bash", "scripts/xnulinux-boot.sh"], cwd=self.a.poc_dir, env=child_env(env),
+                               stdin=subprocess.DEVNULL, stdout=flog, stderr=subprocess.STDOUT,
+                               timeout=max(300, self.a.boot_timeout * 3))
+        return r.returncode
+
+    def boot_stop(self, env):
+        r = subprocess.run(["bash", "scripts/xnulinux-boot.sh", "stop"], cwd=self.a.poc_dir,
+                           env=child_env(dict(env or {}, FAST_STOP="1")), stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180)
+        return r.returncode
+
+    def boot_failure(self, attempt, job_index):
+        r = self.sudo("dmesg", check=False, timeout=15)
+        for line in r.stdout.splitlines():
+            if FAILURE_RE.search(line):
+                return line.strip()[:200]
+        return None
+
+    def guest_candidates(self):
+        rows = []
+        with contextlib.suppress(OSError):
+            with open(LEASES) as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        try:
+                            rows.append((int(parts[0]), parts[2]))
+                        except ValueError:
+                            rows.append((0, parts[2]))
+        ips = [ip for _, ip in sorted(rows, reverse=True)]
+        if STATIC_GUEST_IP not in ips:
+            ips.append(STATIC_GUEST_IP)
+        seen, out = set(), []
+        for ip in ips:
+            if ip not in seen and re.fullmatch(r"[0-9.]+", ip):
+                seen.add(ip)
+                out.append(ip)
+        return out[:4]
+
+    def ssh_argv(self, ip, remote, connect_timeout=10):
+        return ["ssh", "-i", self.a.ssh_key, *SSH_OPTS, "-o", f"ConnectTimeout={connect_timeout}",
+                f"{self.a.guest_user}@{ip}", remote]
+
+    def ssh_ok(self, ip):
+        try:
+            r = subprocess.run(self.ssh_argv(ip, "true", 3), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=8, env=child_env())
+            return r.returncode == 0
+        except subprocess.TimeoutExpired:
+            return False
+
+    def ssh_script(self, ip, script, *, stdin_data=None, stdin_path=None, log_path, prefix, timeout=0,
+                   kind="script", start_marker=None, start_timeout=0):
+        remote = "/bin/bash -c " + shlex.quote(script)
+        return stream_process(self.ssh_argv(ip, remote), stdin_data=stdin_data, stdin_path=stdin_path,
+                              log_path=log_path, prefix=prefix, env=child_env(), timeout=timeout,
+                              start_marker=start_marker, start_timeout=start_timeout)
+
+    def read_tx_dropped(self):
+        try:
+            with open(TX_DROPPED) as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            return None
+
+    def scratch_root(self, job_id):
+        return GUEST_SCRATCH
+
+    # -- reaping
+    def reap_stale(self, shm_dir):
+        disk_param = ""
+        with contextlib.suppress(OSError):
+            with open("/sys/module/xnu/parameters/disk") as f:
+                disk_param = f.read()
+        if self.xnu_loaded() and DM_PREFIX in disk_param:
+            log.warning("reap: stopping orphaned guest on %s", disk_param.strip())
+            with contextlib.suppress(Exception):
+                self.boot_stop({})
+        r = self.sudo("dmsetup", "ls", check=False)
+        for line in r.stdout.splitlines():
+            name = line.split()[0] if line.split() else ""
+            if not name.startswith(DM_PREFIX):
+                continue
+            dm = os.path.basename(os.path.realpath(f"/dev/mapper/{name}"))
+            slaves = []
+            with contextlib.suppress(OSError):
+                slaves = ["/dev/" + s for s in os.listdir(f"/sys/block/{dm}/slaves")]
+            log.warning("reap: removing stale %s (slaves %s)", name, ",".join(slaves) or "-")
+            try:
+                self.dm_remove(name)
+            except Exception as e:
+                log.error("reap: %s", e)
+                continue
+            for s in slaves:
+                if s.startswith("/dev/loop"):
+                    with contextlib.suppress(Exception):
+                        self.loop_detach(s)
+        r = subprocess.run(["losetup", "-l", "-n", "-O", "NAME,BACK-FILE"], stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, text=True)
+        for line in r.stdout.splitlines():
+            parts = line.split(None, 1)
+            if len(parts) == 2 and parts[1].startswith(os.path.join(shm_dir, SHM_PREFIX)):
+                log.warning("reap: detaching %s (%s)", parts[0], parts[1].strip())
+                with contextlib.suppress(Exception):
+                    self.loop_detach(parts[0])
+        remove_shm_files(shm_dir)
+
+
+class DryHost(RealHost):
+    """Simulates every privileged or remote step; the supervisor state machine, the golden
+    checks, queue handling, telemetry and /dev/shm bookkeeping are the real code."""
+    dry = True
+
+    def __init__(self, a):
+        super().__init__(a)
+        self.loop_n = 0
+        self.fail_first = int(os.environ.get("XNU_RUNNERD_DRY_FAIL_FIRST", "0") or 0)
+        self.fail_all = os.environ.get("XNU_RUNNERD_DRY_FAIL_ALL", "0") == "1"
+        self.dms = set()
+        self.loops = set()
+
+    def sudo(self, *cmd, check=True, timeout=60):
+        raise AssertionError(f"dry-run must not call sudo: {cmd[:1]}")
+
+    def attach_loop(self, path, read_only):
+        self.loop_n += 1
+        dev = f"/dev/loop{900 + self.loop_n}"
+        self.loops.add(dev)
+        log.info("[dry] losetup --find --show%s %s -> %s", " --read-only" if read_only else "", path, dev)
+        return dev
+
+    def sectors(self, dev):
+        return os.stat(self.a.golden_img).st_size // 512
+
+    def dm_create(self, name, table):
+        log.info("[dry] dmsetup create %s --table '%s'", name, table)
+        self.dms.add(name)
+
+    def dm_remove(self, name):
+        log.info("[dry] dmsetup remove --retry %s", name)
+        self.dms.discard(name)
+
+    def loop_detach(self, dev):
+        log.info("[dry] losetup -d %s", dev)
+        self.loops.discard(dev)
+
+    def xnu_loaded(self):
+        return False
+
+    def boot_start(self, env, log_path, attempt, job_index):
+        with open(log_path, "a") as f:
+            f.write(f"[dry] CI_HEADLESS={env['CI_HEADLESS']} FAST_BOOT={env['FAST_BOOT']} DISK={env['DISK']} "
+                    f"CPUS={env['CPUS']} RAM_MB={env['RAM_MB']} bash scripts/xnulinux-boot.sh (attempt {attempt})\n")
+        time.sleep(0.02)
+        return 0
+
+    def boot_stop(self, env):
+        log.info("[dry] FAST_STOP=1 bash scripts/xnulinux-boot.sh stop")
+        return 0
+
+    def boot_failure(self, attempt, job_index):
+        if self.fail_all or (attempt == 1 and job_index <= self.fail_first):
+            return "[dry] injected: userspace panic: posix_spawn: 14: Bad address"
+        return None
+
+    def guest_candidates(self):
+        return ["192.0.2.2"]
+
+    def ssh_ok(self, ip):
+        return True
+
+    def scratch_root(self, job_id):
+        return os.path.join(self.a.shm_dir, f"{SHM_PREFIX}scratch-{job_id}")
+
+    def ssh_script(self, ip, script, *, stdin_data=None, stdin_path=None, log_path, prefix, timeout=0,
+                   kind="script", start_marker=None, start_timeout=0):
+        if kind in ("script", "scratch", "prep"):
+            # mock jobs and scratch setup run locally against the dry scratch dir
+            return stream_process(["bash", "-c", script], stdin_data=stdin_data, stdin_path=stdin_path,
+                                  log_path=log_path, prefix=prefix, env=child_env({"XNU_RUNNERD_DRY_RUN": "1"}),
+                                  timeout=timeout)
+        with open(log_path, "a") as f:
+            f.write(f"[dry] ssh {self.a.guest_user}@{ip} <runner command, secret on stdin: "
+                    f"{'yes' if stdin_data else 'no'}>\n[dry] Running job: simulated\n")
+        return 0, None
+
+    def read_tx_dropped(self):
+        return 0
+
+    def reap_stale(self, shm_dir):
+        log.info("[dry] reap: dmsetup ls / losetup -l scan for %s* (simulated)", DM_PREFIX)
+        remove_shm_files(shm_dir)
+
+
+def remove_shm_files(shm_dir):
+    try:
+        names = os.listdir(shm_dir)
+    except OSError:
+        return
+    for n in names:
+        if not n.startswith(SHM_PREFIX):
+            continue
+        log.warning("reap: removing %s", os.path.join(shm_dir, n))
+        p = os.path.join(shm_dir, n)
+        if os.path.isdir(p) and not os.path.islink(p):
+            shutil.rmtree(p, ignore_errors=True)
+        else:
+            with contextlib.suppress(OSError):
+                os.unlink(p)
+
+
+# --------------------------------------------------------------------------- GitHub
+
+class GitHubError(Exception):
+    def __init__(self, code, msg):
+        super().__init__(f"GitHub API {code}: {msg}")
+        self.code = code
+
+
+class GitHub:
+    def __init__(self, repo, token, api_url):
+        self.repo = repo
+        self._token = token
+        self.api = api_url.rstrip("/")
+        REDACTOR.add(token)
+
+    def req(self, method, path, body=None):
+        data = json.dumps(body).encode() if body is not None else None
+        r = urllib.request.Request(self.api + path, data=data, method=method, headers={
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Authorization": f"Bearer {self._token}",
+            "User-Agent": "xnu-runnerd/" + VERSION,
+            **({"Content-Type": "application/json"} if data else {}),
+        })
+        try:
+            with urllib.request.urlopen(r, timeout=30) as resp:
+                raw = resp.read()
+                return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as e:
+            msg = ""
+            with contextlib.suppress(Exception):
+                msg = json.loads(e.read() or b"{}").get("message", "")
+            raise GitHubError(e.code, msg[:200] or e.reason) from None
+        except urllib.error.URLError as e:
+            raise GitHubError("network", str(e.reason)[:200]) from None
+
+    def jit_config(self, name, labels):
+        d = self.req("POST", f"/repos/{self.repo}/actions/runners/generate-jitconfig",
+                     {"name": name, "runner_group_id": 1, "labels": labels, "work_folder": "_work"})
+        jit = d.get("encoded_jit_config") or ""
+        if not jit:
+            raise GitHubError("bad-response", "no encoded_jit_config")
+        REDACTOR.add(jit)
+        return jit, (d.get("runner") or {}).get("id")
+
+    def registration_token(self):
+        tok = self.req("POST", f"/repos/{self.repo}/actions/runners/registration-token").get("token") or ""
+        if not tok:
+            raise GitHubError("bad-response", "no registration token")
+        REDACTOR.add(tok)
+        return tok
+
+    def delete_runner(self, runner_id=None, name=None):
+        try:
+            if runner_id is None and name:
+                d = self.req("GET", f"/repos/{self.repo}/actions/runners?per_page=100")
+                for r in d.get("runners", []):
+                    if r.get("name") == name:
+                        runner_id = r.get("id")
+            if runner_id is not None:
+                self.req("DELETE", f"/repos/{self.repo}/actions/runners/{int(runner_id)}")
+                log.info("deleted leftover runner registration %s", runner_id)
+        except GitHubError as e:
+            if e.code not in (404, 422):
+                log.warning("runner cleanup: %s", e)
+
+    def queued_job_for(self, labels):
+        """True when a queued job whose runs-on labels are all ours is waiting."""
+        want = {l.lower() for l in labels}
+        for status in ("queued", "in_progress"):
+            d = self.req("GET", f"/repos/{self.repo}/actions/runs?status={status}&per_page=20")
+            for run in d.get("workflow_runs", [])[:20]:
+                jobs = self.req("GET", f"/repos/{self.repo}/actions/runs/{int(run['id'])}/jobs?filter=latest&per_page=100")
+                for j in jobs.get("jobs", []):
+                    if j.get("status") == "queued" and j.get("labels") and \
+                            {l.lower() for l in j["labels"]} <= want:
+                        return f"run {run['id']} job {j.get('name')!r}"
+        return None
+
+
+# --------------------------------------------------------------------------- supervisor
+
+class Job:
+    def __init__(self, kind, name, path=None):
+        self.kind, self.name, self.path = kind, name, path
+
+
+class Resources:
+    def __init__(self, job_id, shm_dir):
+        self.job_id = job_id
+        self.dm_name = f"{DM_PREFIX}{job_id}"
+        self.cow_file = os.path.join(shm_dir, f"{SHM_PREFIX}cow-{job_id}.img")
+        self.job_dir = os.path.join(shm_dir, f"{SHM_PREFIX}job-{job_id}")
+        self.base_loop = None
+        self.cow_loop = None
+        self.dm_active = False
+        self.booted = False
+
+
+class Supervisor:
+    def __init__(self, a, host):
+        self.a = a
+        self.host = host
+        self.seq = 0
+        self.results = []
+        self.gh = None
+        self.host_tag = re.sub(r"[^A-Za-z0-9-]", "-", socket.gethostname().split(".")[0])[:20]
+
+    # -- golden
+    def check_golden(self):
+        img = self.a.golden_img
+        if not os.path.isfile(img) or os.path.getsize(img) == 0:
+            raise FatalError(f"missing or empty golden image {img}")
+        mode = os.stat(img).st_mode
+        if mode & 0o222 and not self.a.allow_writable_golden:
+            raise FatalError(f"golden image {img} is writable (mode {oct(mode & 0o777)}); "
+                             f"chmod a-w it or pass --allow-writable-golden")
+
+    # -- per-job resources
+    def golden_uuids(self):
+        conf = os.path.join(self.a.golden, "mac.conf")
+        out = {}
+        with contextlib.suppress(OSError):
+            with open(conf) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    k = k.strip()
+                    if k in ("ROOT_UUID", "BOOT_UUID"):
+                        out[k] = v.strip().strip("'\"")
+        return out
+
+    def boot_env(self, res):
+        env = {"CI_HEADLESS": "1", "FAST_BOOT": "1", "FAST_STOP": "1",
+               "CPUS": str(self.a.cpus), "RAM_MB": str(self.a.ram_mb),
+               "DISK": f"/dev/mapper/{res.dm_name}", "KEYSTORE": os.path.join(res.job_dir, "keystore.bin"),
+               "CONSOLE_IN": os.path.join(res.job_dir, "console-in"),
+               "INPUT_IN": os.path.join(res.job_dir, "input"), "FB_DUMP": os.path.join(res.job_dir, "fb.raw")}
+        env.update(self.golden_uuids())
+        return env
+
+    def setup_cow(self, res):
+        with SIG.shielded():
+            os.makedirs(res.job_dir, exist_ok=True)
+            ks_src = os.path.join(self.a.golden, "keystore.bin")
+            ks = os.path.join(res.job_dir, "keystore.bin")
+            if os.path.isfile(ks_src) and os.path.getsize(ks_src) > 0:
+                shutil.copyfile(ks_src, ks)
+            else:
+                with open(ks, "wb") as f:
+                    f.truncate(1 << 20)
+            for n in ("console-in", "input", "fb.raw"):
+                open(os.path.join(res.job_dir, n), "wb").close()
+            with open(res.cow_file, "wb") as f:
+                f.truncate(self.a.cow_size)
+            res.base_loop = self.host.attach_loop(self.a.golden_img, read_only=True)
+            sectors = self.host.sectors(res.base_loop)
+            res.cow_loop = self.host.attach_loop(res.cow_file, read_only=False)
+            self.host.dm_create(res.dm_name, f"0 {sectors} snapshot {res.base_loop} {res.cow_loop} N 16")
+            res.dm_active = True
+
+    def teardown(self, res):
+        with SIG.shielded(raise_after=False):
+            ok = True
+            if res.booted:
+                try:
+                    self.host.boot_stop(self.boot_env(res))
+                    res.booted = False
+                except Exception as e:
+                    ok = False
+                    log.error("teardown: guest stop: %s", e)
+            if res.dm_active:
+                try:
+                    self.host.dm_remove(res.dm_name)
+                    res.dm_active = False
+                except Exception as e:
+                    ok = False
+                    log.error("teardown: %s", e)
+            for attr in ("cow_loop", "base_loop"):
+                dev = getattr(res, attr)
+                if dev and not res.dm_active:
+                    try:
+                        self.host.loop_detach(dev)
+                        setattr(res, attr, None)
+                    except Exception as e:
+                        ok = False
+                        log.error("teardown: %s", e)
+            if not res.dm_active and not res.cow_loop:
+                with contextlib.suppress(OSError):
+                    os.unlink(res.cow_file)
+            shutil.rmtree(res.job_dir, ignore_errors=True)
+            if self.host.dry:
+                shutil.rmtree(self.host.scratch_root(res.job_id), ignore_errors=True)
+            return ok
+
+    # -- boot supervision
+    def boot(self, res, job_index):
+        attempts = 0
+        last = "unknown"
+        boot_log = os.path.join(self.a.log_dir, f"{res.job_id}-boot.log")
+        for attempt in range(1, self.a.boot_retries + 1):
+            attempts = attempt
+            if attempt > 1:
+                self.teardown(res)  # retry cleanly: fresh CoW, fresh keystore copy
+            if self.host.xnu_loaded():
+                raise FatalError("xnu.ko is already loaded (another guest is running); refusing to boot")
+            self.setup_cow(res)
+            t0 = mono()
+            res.booted = True
+            rc = self.host.boot_start(self.boot_env(res), boot_log, attempt, job_index)
+            if rc != 0:
+                last = f"xnulinux-boot.sh rc={rc}"
+            else:
+                ip, last = self.wait_guest(t0, attempt, job_index)
+                if ip:
+                    return ip, attempts
+            log.warning("job %s: boot attempt %d/%d failed: %s", res.job_id, attempt, self.a.boot_retries, last)
+            with SIG.shielded():
+                with contextlib.suppress(Exception):
+                    self.host.boot_stop(self.boot_env(res))
+                res.booted = False
+        raise BootFailed(f"{attempts} attempt(s): {last}")
+
+    def wait_guest(self, t0, attempt, job_index):
+        while mono() - t0 < self.a.boot_timeout:
+            fail = self.host.boot_failure(attempt, job_index)
+            if fail:
+                return None, f"early boot failure: {fail}"
+            for ip in self.host.guest_candidates():
+                if self.host.ssh_ok(ip):
+                    return ip, None
+            time.sleep(0.5)
+        return None, f"no SSH within {self.a.boot_timeout}s"
+
+    # -- guest steps
+    def scratch_env(self, job_id, enabled):
+        if not enabled:
+            return {}
+        root = self.host.scratch_root(job_id)
+        return {"CI_SCRATCH_DIR": root, "TMPDIR": f"{root}/tmp", "BENCH_WORK": f"{root}/work",
+                "CARGO_TARGET_DIR": f"{root}/cargo-target", "GOCACHE": f"{root}/go-cache",
+                "GOTMPDIR": f"{root}/go-tmp"}
+
+    def setup_scratch(self, ip, job_id, log_path):
+        mb = int(self.a.ram_scratch_mb)
+        root = self.host.scratch_root(job_id)
+        if self.host.dry:
+            script = f"set -e; mkdir -p {shlex.quote(root)}/{{tmp,work,cargo-target,go-cache,go-tmp}}"
+        else:
+            script = (
+                "set -e\n"
+                f"if [ ! -d {GUEST_SCRATCH} ]; then\n"
+                f"  dev=$(hdiutil attach -nomount ram://$(({mb} * 2048)) | awk 'NR==1{{print $1}}')\n"
+                "  [ -n \"$dev\" ] || { echo 'hdiutil attach failed' >&2; exit 1; }\n"
+                "  diskutil erasevolume APFS CIScratch \"$dev\" >/dev/null\n"
+                "fi\n"
+                f"mkdir -p {GUEST_SCRATCH}/{{tmp,work,cargo-target,go-cache,go-tmp}}\n"
+            )
+        rc, _ = self.host.ssh_script(ip, script, log_path=log_path, prefix=f"[{job_id} scratch] ",
+                                     timeout=120, kind="scratch")
+        return rc == 0
+
+    def exports(self, env):
+        return "".join(f"export {k}={shlex.quote(v)}; " for k, v in env.items())
+
+    def execute(self, job, ip, res, env, log_path):
+        """Returns (rc, status)."""
+        prefix = f"[{res.job_id}] "
+        ex = self.exports(dict(env, XNU_RUNNERD_JOB_ID=res.job_id))
+        if self.a.guest_prep_script:
+            rc, _ = self.host.ssh_script(ip, ex + "exec bash -s", stdin_path=self.a.guest_prep_script,
+                                         log_path=log_path, prefix=f"[{res.job_id} prep] ", timeout=1800, kind="prep")
+            if rc != 0:
+                return rc, "prep_failed"
+        if job.kind == "script":
+            arg_str = ""
+            if self.a.job_args:
+                arg_str = " -- " + " ".join(shlex.quote(x) for x in shlex.split(self.a.job_args))
+            rc, why = self.host.ssh_script(ip, ex + "exec bash -s" + arg_str, stdin_path=job.path, log_path=log_path,
+                                           prefix=prefix, timeout=self.a.job_timeout, kind="script")
+            return rc, ("timeout" if why else ("ok" if rc == 0 else "job_failed"))
+        # GitHub runner jobs: the secret is minted only once the guest is up, and travels on stdin only
+        runner = f"{self.a.runner_prefix}-{self.host_tag}-{res.job_id}"[:64]
+        runner_id = None
+        clean = "rm -f .runner .credentials .credentials_rsaparams 2>/dev/null; "
+        if self.a.mode == "github-jit":
+            if self.host.dry:
+                secret = "DRY-RUN-JIT-CONFIG"
+            else:
+                secret, runner_id = self.gh.jit_config(runner, self.a.labels)
+            script = ex + "cd ~/actions-runner || exit 3; " + clean + \
+                'IFS= read -r _jit && exec ./run.sh --jitconfig "$_jit"'
+        else:
+            secret = "DRY-RUN-REG-TOKEN" if self.host.dry else self.gh.registration_token()
+            url = f"{self.a.server_url.rstrip('/')}/{self.a.repo}"
+            script = ex + "cd ~/actions-runner || exit 3; " + clean + \
+                'IFS= read -r _tok && ./config.sh --url ' + shlex.quote(url) + ' --token "$_tok" --name ' + \
+                shlex.quote(runner) + ' --labels ' + shlex.quote(",".join(self.a.labels)) + \
+                ' --work _work --ephemeral --unattended --replace && unset _tok && exec ./run.sh'
+        log.info("job %s: runner %s starting (%s)", res.job_id, runner, self.a.mode)
+        idle = self.a.runner_idle_timeout if self.a.wait_for_queued else 0
+        try:
+            rc, why = self.host.ssh_script(ip, script, stdin_data=(secret + "\n").encode(), log_path=log_path,
+                                           prefix=prefix, timeout=self.a.job_timeout, kind="github",
+                                           start_marker=b"Running job:", start_timeout=idle)
+        finally:
+            secret = None
+            if self.gh and not self.host.dry:
+                with SIG.shielded(raise_after=False):
+                    self.gh.delete_runner(runner_id, None if runner_id else runner)
+        if why == "idle":
+            return rc, "idle_timeout"
+        return rc, ("timeout" if why else ("ok" if rc == 0 else "job_failed"))
+
+    # -- one job, end to end
+    def run_job(self, job):
+        self.seq += 1
+        job_id = f"{int(time.time())}-{os.getpid()}-{self.seq}"
+        res = Resources(job_id, self.a.shm_dir)
+        log_path = os.path.join(self.a.log_dir, f"{job_id}.log")
+        rec = {"job_id": job_id, "timestamp_utc": utc_now(), "mode": self.a.mode, "job_name": job.name,
+               "boot_attempts": 0, "boot_s": None, "job_s": None, "teardown_s": None, "total_s": None,
+               "tx_dropped_before": None, "tx_dropped_after": None, "tx_dropped_delta": None,
+               "golden_mutated": None, "exit_code": None, "status": "error", "guest_ip": None,
+               "cpus": self.a.cpus, "ram_mb": self.a.ram_mb, "ram_scratch_mb": self.a.ram_scratch_mb,
+               "ram_scratch_ok": None, "dry_run": self.host.dry}
+        log.info("job %s: start (%s)", job_id, job.name)
+        t0 = mono()
+        stopping = None
+        self.check_golden()
+        g_before = golden_stat(self.a.golden_img)
+        rec["tx_dropped_before"] = self.host.read_tx_dropped()
+        try:
+            tb = mono()
+            ip = None
+            try:
+                ip, rec["boot_attempts"] = self.boot(res, self.seq)
+            except BootFailed as e:
+                rec["boot_attempts"] = self.a.boot_retries
+                rec["status"] = "boot_failed"
+                log.error("job %s: boot failed: %s", job_id, e)
+            rec["boot_s"] = round(mono() - tb, 3)
+            if ip:
+                rec["guest_ip"] = ip
+                log.info("job %s: guest %s up in %.2fs (%d attempt(s))", job_id, ip, rec["boot_s"],
+                         rec["boot_attempts"])
+                scratch = False
+                if self.a.ram_scratch_mb > 0:
+                    scratch = self.setup_scratch(ip, job_id, log_path)
+                    rec["ram_scratch_ok"] = scratch
+                    if not scratch:
+                        log.warning("job %s: RAM scratch setup failed; running on the CoW disk", job_id)
+                tj = mono()
+                try:
+                    rc, status = self.execute(job, ip, res, self.scratch_env(job_id, scratch), log_path)
+                    rec["exit_code"], rec["status"] = rc, status
+                except GitHubError as e:
+                    log.error("job %s: %s", job_id, e)
+                    rec["status"] = "github_error"
+                finally:
+                    rec["job_s"] = round(mono() - tj, 3)
+        except Stop as e:
+            stopping = e
+            rec["status"] = "aborted"
+        except FatalError:
+            raise
+        except Exception as e:
+            log.exception("job %s: %s", job_id, e)
+            rec["status"] = "error"
+        finally:
+            tt = mono()
+            if not self.teardown(res) and rec["status"] == "ok":
+                rec["status"] = "teardown_error"
+            rec["teardown_s"] = round(mono() - tt, 3)
+            with contextlib.suppress(OSError):
+                rec["golden_mutated"] = golden_stat(self.a.golden_img) != g_before
+            rec["tx_dropped_after"] = self.host.read_tx_dropped()
+            if rec["tx_dropped_before"] is not None and rec["tx_dropped_after"] is not None:
+                rec["tx_dropped_delta"] = rec["tx_dropped_after"] - rec["tx_dropped_before"]
+            rec["total_s"] = round(mono() - t0, 3)
+            self.write_telemetry(rec)
+            self.results.append(rec)
+            log.info("job %s: %s exit=%s boot=%.2fs job=%s teardown=%.3fs golden_mutated=%s", job_id,
+                     rec["status"], rec["exit_code"], rec["boot_s"] or 0, rec["job_s"], rec["teardown_s"],
+                     rec["golden_mutated"])
+            if rec["golden_mutated"]:
+                log.critical("golden image changed during job %s: stopping the fleet", job_id)
+        if stopping:
+            raise stopping
+        if rec["golden_mutated"]:
+            raise FatalError("golden image mutated")
+        return rec
+
+    def write_telemetry(self, rec):
+        os.makedirs(os.path.dirname(os.path.abspath(self.a.telemetry_log)), exist_ok=True)
+        with open(self.a.telemetry_log, "a") as f:
+            f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+    # -- job sources
+    def queue_jobs(self):
+        qd = self.a.queue_dir
+        done = 0
+        while not SIG.stop_requested and (self.a.max_jobs == 0 or done < self.a.max_jobs):
+            cands = sorted(n for n in os.listdir(qd) if n.endswith(".sh")
+                           and os.path.isfile(os.path.join(qd, n)) and os.access(os.path.join(qd, n), os.X_OK))
+            claimed = None
+            for n in cands:
+                src = os.path.join(qd, n)
+                try:
+                    os.rename(src, src + ".running")  # atomic claim
+                    claimed = n
+                    break
+                except FileNotFoundError:
+                    continue
+            if not claimed:
+                if self.a.exit_when_empty:
+                    return
+                time.sleep(self.a.poll_interval)
+                continue
+            running = os.path.join(qd, claimed + ".running")
+            try:
+                yield Job("script", claimed, running)
+            finally:
+                with contextlib.suppress(OSError):
+                    os.rename(running, os.path.join(qd, claimed + ".done"))
+            done += 1
+
+    def script_jobs(self):
+        for i in range(self.a.max_jobs or 1):
+            if SIG.stop_requested:
+                return
+            yield Job("script", f"{os.path.basename(self.a.job_script)}#{i + 1}", self.a.job_script)
+
+    def github_jobs(self):
+        done = 0
+        while not SIG.stop_requested and (self.a.max_jobs == 0 or done < self.a.max_jobs):
+            if self.a.wait_for_queued and not self.host.dry:
+                try:
+                    found = self.gh.queued_job_for(self.a.labels)
+                except GitHubError as e:
+                    log.warning("queue poll: %s", e)
+                    found = None
+                if not found:
+                    time.sleep(self.a.poll_interval)
+                    continue
+                log.info("queued job for labels %s: %s", ",".join(self.a.labels), found)
+            yield Job("github", f"{self.a.mode}#{done + 1}")
+            done += 1
+
+    def run(self):
+        if self.a.mode == "mock-queue":
+            src = self.queue_jobs() if self.a.queue_dir else self.script_jobs()
+        else:
+            src = self.github_jobs()
+        try:
+            for job in src:
+                self.run_job(job)
+        except Stop:
+            log.info("stopped by signal")
+        finally:
+            with contextlib.suppress(Exception):
+                src.close()
+        bad = [r for r in self.results if r["status"] != "ok"]
+        log.info("done: %d job(s), %d not ok", len(self.results), len(bad))
+        if SIG.stop_requested:
+            return 0
+        if self.a.mode == "mock-queue" and bad:
+            return 1
+        return 0
+
+
+# --------------------------------------------------------------------------- main
+
+def read_token(a):
+    if a.token_file:
+        try:
+            with open(a.token_file) as f:
+                tok = f.read().strip()
+        except OSError as e:
+            raise FatalError(f"cannot read --token-file: {e.strerror}")
+    else:
+        tok = os.environ.get("GITHUB_TOKEN", "").strip()
+    if not tok:
+        raise FatalError("no GitHub token: use --token-file PATH or the GITHUB_TOKEN environment variable")
+    if any(c.isspace() for c in tok):
+        raise FatalError("GitHub token contains whitespace")
+    return tok
+
+
+def build_parser():
+    ncpu = os.cpu_count() or 2
+    p = argparse.ArgumentParser(
+        prog="xnu-runnerd",
+        description="Host fleet supervisor for ephemeral dm-snapshot CoW headless macOS CI jobs (xnulinux).",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        epilog="The GitHub token is read only from --token-file or $GITHUB_TOKEN, never from the command line.",
+        allow_abbrev=False)
+    p.add_argument("--mode", choices=["mock-queue", "github-jit", "github-reg"], required=True)
+    p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    q = p.add_argument_group("mock-queue")
+    q.add_argument("--queue-dir", help="consume executable *.sh jobs (claimed via rename to .running, then .done)")
+    q.add_argument("--job-script", help="run this script as the job")
+    q.add_argument("--job-args", default="", help="shell-quoted arguments passed to --job-script (bash -s -- ...)")
+    q.add_argument("--count", "--max-jobs", dest="max_jobs", type=int, default=None,
+                   help="jobs to run (0 = until SIGTERM/SIGINT; default 1 for --job-script, 0 otherwise)")
+    q.add_argument("--exit-when-empty", action="store_true", help="queue mode: exit when no job is waiting")
+    g = p.add_argument_group("github-jit / github-reg")
+    g.add_argument("--repo", help="OWNER/REPO")
+    g.add_argument("--labels", default="self-hosted,macOS,ARM64")
+    g.add_argument("--runner-prefix", default="xnu-ci")
+    g.add_argument("--token-file", help="file holding the GitHub token (else $GITHUB_TOKEN)")
+    g.add_argument("--wait-for-queued", dest="wait_for_queued", action="store_true", default=True,
+                   help="boot a guest only when a queued job matches --labels")
+    g.add_argument("--no-wait-for-queued", dest="wait_for_queued", action="store_false",
+                   help="boot a guest and keep a runner listening for the next job")
+    g.add_argument("--runner-idle-timeout", type=int, default=600,
+                   help="with --wait-for-queued: seconds a runner may wait for a job before it is recycled")
+    g.add_argument("--api-url", default="https://api.github.com")
+    g.add_argument("--server-url", default="https://github.com")
+    p.add_argument("--poll-interval", type=float, default=5.0)
+    p.add_argument("--job-timeout", type=int, default=21600, help="seconds, 0 = none")
+    p.add_argument("--guest-prep-script", help="script run in the guest (bash -s) before every job")
+    c = p.add_argument_group("guest / CoW lifecycle")
+    c.add_argument("--poc-dir", default=None, help="xnulinux tree with scripts/xnulinux-boot.sh (auto-detected)")
+    c.add_argument("--golden", default="/var/tmp/golden", help="dir with read-only mac.img (+ keystore.bin)")
+    c.add_argument("--cow-size", type=parse_size, default="12G")
+    c.add_argument("--cpus", type=int, default=max(1, ncpu - 1))
+    c.add_argument("--ram-mb", type=int, default=7900)
+    c.add_argument("--ssh-key", default="~/.ssh/hosted")
+    c.add_argument("--guest-user", default="xnu")
+    c.add_argument("--boot-timeout", type=int, default=90)
+    c.add_argument("--boot-retries", type=int, default=2, help="boot attempts per job")
+    c.add_argument("--ram-scratch-mb", type=int, default=1536, help="guest APFS RAM disk size, 0 = off")
+    c.add_argument("--shm-dir", default="/dev/shm", help=argparse.SUPPRESS)
+    c.add_argument("--allow-writable-golden", action="store_true")
+    o = p.add_argument_group("operations")
+    o.add_argument("--telemetry-log", default="/var/tmp/xnu-runnerd-telemetry.jsonl")
+    o.add_argument("--log-dir", default="/var/tmp/xnu-runnerd-logs")
+    o.add_argument("--lock-file", default=None, help="default /var/tmp/xnu-runnerd.lock (dry-run: in --log-dir)")
+    o.add_argument("--reap-stale", action="store_true", help="remove orphaned xnu-runnerd-cow-* devices at start")
+    o.add_argument("--dry-run", action="store_true", help="simulate; no sudo/insmod/dmsetup/losetup/ssh")
+    o.add_argument("-v", "--verbose", action="store_true")
+    return p
+
+
+def validate(a, p):
+    if a.mode == "mock-queue":
+        if bool(a.queue_dir) == bool(a.job_script):
+            p.error("mock-queue needs exactly one of --queue-dir or --job-script")
+        if a.job_script and not os.access(a.job_script, os.R_OK):
+            p.error(f"--job-script {a.job_script} not readable")
+        if a.queue_dir and not os.path.isdir(a.queue_dir):
+            p.error(f"--queue-dir {a.queue_dir} is not a directory")
+        if a.max_jobs is None:
+            a.max_jobs = 1 if a.job_script else 0
+    else:
+        if not a.repo or not REPO_RE.match(a.repo):
+            p.error("--repo OWNER/REPO required")
+        if a.max_jobs is None:
+            a.max_jobs = 0
+        if not PREFIX_RE.match(a.runner_prefix):
+            p.error("--runner-prefix: letters, digits, . _ - only")
+    a.labels = [l.strip() for l in a.labels.split(",") if l.strip()]
+    if not a.labels or not all(LABEL_RE.match(l) for l in a.labels):
+        p.error("--labels: comma-separated letters, digits, . _ -")
+    if a.guest_prep_script and not os.access(a.guest_prep_script, os.R_OK):
+        p.error(f"--guest-prep-script {a.guest_prep_script} not readable")
+    if a.max_jobs < 0 or a.boot_retries < 1 or a.cpus < 1 or a.ram_mb < 512 or a.ram_scratch_mb < 0:
+        p.error("invalid numeric option")
+    a.ssh_key = os.path.expanduser(a.ssh_key)
+    # the boot script runs from --poc-dir, so every path handed to it must be absolute
+    for k in ("golden", "shm_dir", "log_dir", "telemetry_log", "job_script", "queue_dir", "guest_prep_script",
+              "token_file", "poc_dir", "lock_file"):
+        if getattr(a, k):
+            setattr(a, k, os.path.abspath(os.path.expanduser(getattr(a, k))))
+    a.poc_dir = a.poc_dir or detect_poc_dir()
+    a.golden_img = os.path.join(a.golden, "mac.img")
+    if not a.lock_file:
+        a.lock_file = os.path.join(a.log_dir, "xnu-runnerd-dry.lock") if a.dry_run else "/var/tmp/xnu-runnerd.lock"
+
+
+def main(argv=None):
+    p = build_parser()
+    a = p.parse_args(argv)
+    validate(a, p)
+    logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO, stream=sys.stderr,
+                        format="%(asctime)s xnu-runnerd %(levelname)s %(message)s")
+    for h in logging.getLogger().handlers:
+        h.addFilter(REDACTOR)
+    signal.signal(signal.SIGTERM, SIG.handler)
+    signal.signal(signal.SIGINT, SIG.handler)
+    try:
+        os.makedirs(a.log_dir, exist_ok=True)
+        lock = open(a.lock_file, "w")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise FatalError(f"another xnu-runnerd holds {a.lock_file}")
+        host = DryHost(a) if a.dry_run else RealHost(a)
+        if not a.dry_run:
+            if not os.path.isfile(os.path.join(a.poc_dir, "scripts", "xnulinux-boot.sh")):
+                raise FatalError(f"no scripts/xnulinux-boot.sh under --poc-dir {a.poc_dir}")
+            if not os.access(a.ssh_key, os.R_OK):
+                raise FatalError(f"guest SSH key {a.ssh_key} not readable")
+        sup = Supervisor(a, host)
+        sup.check_golden()
+        if a.mode != "mock-queue":
+            tok = None if a.dry_run else read_token(a)
+            if tok:
+                sup.gh = GitHub(a.repo, tok, a.api_url)
+            os.environ.pop("GITHUB_TOKEN", None)
+            del tok
+        log.info("xnu-runnerd %s mode=%s%s cpus=%d ram_mb=%d cow=%dMiB scratch=%dMiB golden=%s poc=%s", VERSION,
+                 a.mode, " (dry-run)" if a.dry_run else "", a.cpus, a.ram_mb, a.cow_size >> 20, a.ram_scratch_mb,
+                 a.golden_img, a.poc_dir)
+        if a.reap_stale:
+            with SIG.shielded():
+                host.reap_stale(a.shm_dir)
+        return sup.run()
+    except Stop:
+        return 0
+    except FatalError as e:
+        log.error("%s", e)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

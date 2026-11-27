@@ -1,0 +1,7 @@
+if [ -r /var/db/xcrun_db ] && command -v getconf >/dev/null 2>&1; then
+  _xnu_td=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || true)
+  if [ -n "$_xnu_td" ] && [ -d "$_xnu_td" ] && [ ! -e "${_xnu_td%/}/xcrun_db" ]; then
+    cp -f /var/db/xcrun_db "${_xnu_td%/}/xcrun_db" 2>/dev/null || true
+  fi
+  unset _xnu_td
+fi

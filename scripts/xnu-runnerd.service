@@ -1,0 +1,33 @@
+# xnu-runnerd: ephemeral headless macOS CI runner fleet on xnulinux.
+# Install (on the host):
+#   sudo install -m 0644 scripts/xnu-runnerd.service /etc/systemd/system/xnu-runnerd.service
+#   sudo install -m 0600 -o ubuntu /dev/null /etc/xnu-runnerd.token   # then write the GitHub token into it
+#   printf 'XNU_RUNNERD_ARGS=--mode github-jit --repo OWNER/REPO --token-file /etc/xnu-runnerd.token --reap-stale\n' \
+#     | sudo tee /etc/xnu-runnerd.env >/dev/null && sudo chmod 0600 /etc/xnu-runnerd.env
+#   sudo systemctl daemon-reload && sudo systemctl enable --now xnu-runnerd
+# The token goes in a file (--token-file) or as GITHUB_TOKEN=... in /etc/xnu-runnerd.env, never in ExecStart.
+
+[Unit]
+Description=xnulinux Ephemeral Headless CI Runner Fleet Daemon
+After=network-online.target xnulinux-fki.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/xnulinux
+Environment=PYTHONUNBUFFERED=1
+Environment="XNU_RUNNERD_ARGS=--mode mock-queue --queue-dir /var/tmp/xnu-runnerd-queue --reap-stale"
+EnvironmentFile=-/etc/xnu-runnerd.env
+ExecStartPre=/usr/bin/mkdir -p /var/tmp/xnu-runnerd-queue /var/tmp/xnu-runnerd-logs
+ExecStart=/opt/xnulinux/scripts/xnu-runnerd $XNU_RUNNERD_ARGS
+# SIGTERM goes to the daemon only; it stops the guest and removes the CoW snapshot itself
+KillMode=mixed
+KillSignal=SIGTERM
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,84 @@
+#!/bin/bash
+set -euo pipefail
+
+SERVICES=(
+  system/com.apple.WindowServer
+  system/com.apple.loginwindow
+  system/com.apple.logind
+  system/com.apple.coreservices.uiagent
+  system/com.apple.SoftwareUpdateNotificationManager
+  system/com.apple.softwareupdated
+  system/com.apple.mobile.softwareupdated
+  system/com.apple.MobileSoftwareUpdate.CleanupPreparePathService
+  system/com.apple.MobileSoftwareUpdate.CryptegraftService
+  system/com.apple.mobileassetd
+  system/com.apple.MobileAsset.ManifestStorageService
+  system/com.apple.dasd
+  system/com.apple.DASDelegateService
+  system/com.apple.duetexpertd
+  system/com.apple.apsd
+  system/com.apple.metadata.mds
+  system/com.apple.metadata.mds.index
+  system/com.apple.metadata.mds.scan
+  system/com.apple.metadata.mds.spindump
+  system/com.apple.XProtect.daemon.scan
+  system/com.apple.XProtect.daemon.scan.startup
+  system/com.apple.XprotectFramework.PluginService
+  system/com.apple.security.xprotectd
+  system/com.apple.MRT
+  system/com.apple.coreduetd
+  system/com.apple.biomed
+  system/com.apple.triald.system
+  system/com.apple.siri.acousticsignature
+  system/com.apple.PowerUIAgent
+)
+
+STATE=/var/db/xnu-mode.state
+LW=/Library/Preferences/com.apple.loginwindow
+
+cmd="${1:-status}"
+case "$cmd" in
+  headless)
+    mkdir -p /var/db
+    if [ ! -f "$STATE" ]; then
+      au=$(defaults read "$LW" autoLoginUser 2>/dev/null || true)
+      auid=$(defaults read "$LW" autoLoginUserUID 2>/dev/null || true)
+      printf "MODE=headless\nAUTO_LOGIN_USER=%s\nAUTO_LOGIN_UID=%s\n" "$au" "$auid" > "$STATE"
+    else
+      sed -i "" "s/^MODE=.*/MODE=headless/" "$STATE" || true
+    fi
+    for svc in "${SERVICES[@]}"; do
+      launchctl disable "$svc" 2>/dev/null || true
+    done
+    defaults delete "$LW" autoLoginUser 2>/dev/null || true
+    defaults delete "$LW" autoLoginUserUID 2>/dev/null || true
+    echo "xnu-mode: set to headless (${#SERVICES[@]} services disabled; reboot required)"
+    ;;
+  desktop)
+    for svc in "${SERVICES[@]}"; do
+      launchctl enable "$svc" 2>/dev/null || true
+    done
+    if [ -f "$STATE" ]; then
+      . "$STATE"
+      if [ -n "${AUTO_LOGIN_USER:-}" ]; then
+        defaults write "$LW" autoLoginUser -string "$AUTO_LOGIN_USER"
+      fi
+      if [ -n "${AUTO_LOGIN_UID:-}" ]; then
+        defaults write "$LW" autoLoginUserUID -int "$AUTO_LOGIN_UID"
+      fi
+      sed -i "" "s/^MODE=.*/MODE=desktop/" "$STATE" || true
+    fi
+    echo "xnu-mode: set to desktop (services re-enabled; reboot required)"
+    ;;
+  status)
+    ws_dis=$(launchctl print-disabled system 2>/dev/null | grep -c "\"com.apple.WindowServer\" => disabled" || true)
+    au=$(defaults read "$LW" autoLoginUser 2>/dev/null || echo "<none>")
+    ws_pid=$(pgrep -x WindowServer 2>/dev/null || echo "<not running>")
+    nprocs=$(ps -e | wc -l | tr -d " ")
+    echo "mode=$([ "$ws_dis" -gt 0 ] && echo headless || echo desktop) WindowServer_disabled=$ws_dis WindowServer_pid=$ws_pid autoLoginUser=$au procs=$nprocs"
+    ;;
+  *)
+    echo "usage: xnu-mode {headless|desktop|status}" >&2
+    exit 2
+    ;;
+esac

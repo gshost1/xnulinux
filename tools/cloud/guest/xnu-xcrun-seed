@@ -1,0 +1,15 @@
+#!/bin/bash
+set -euo pipefail
+SRC=/var/db/xcrun_db
+[ -r "$SRC" ] || exit 0
+for u in root "${XNU_USER:-xnu}"; do
+  if [ "$u" = root ]; then
+    td=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || true)
+    if [ -n "$td" ] && [ -d "$td" ] && [ ! -L "${td%/}/xcrun_db" ]; then
+      cp -f "$SRC" "${td%/}/xcrun_db"
+      chmod 644 "${td%/}/xcrun_db"
+    fi
+  elif id "$u" >/dev/null 2>&1; then
+    su - "$u" -c 'td=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || true); [ -n "$td" ] && [ -d "$td" ] && cp -f /var/db/xcrun_db "${td%/}/xcrun_db" && chmod 644 "${td%/}/xcrun_db"' || true
+  fi
+done
